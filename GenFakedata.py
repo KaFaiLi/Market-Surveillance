@@ -15,6 +15,17 @@ def generate_market_data(rows=100000):
     # Generate random dates over a 30-day period for 2024
     base_dates = [datetime(2024, 1, 16) + timedelta(days=np.random.randint(0, 30)) for _ in range(rows)]
     
+    # Generate random times (hours, minutes, seconds, milliseconds) for execTime
+    rand_hours   = np.random.randint(0, 24, rows)
+    rand_minutes = np.random.randint(0, 60, rows)
+    rand_seconds = np.random.randint(0, 60, rows)
+    rand_millis  = np.random.randint(0, 1000, rows)
+    
+    exec_times = [
+        d.replace(hour=h, minute=m, second=s, microsecond=ms * 1000)
+        for d, h, m, s, ms in zip(base_dates, rand_hours, rand_minutes, rand_seconds, rand_millis)
+    ]
+    
     data = {
         'dealNature': 'REGULAR_MARKET',
         'dealId': np.random.randint(100000000, 999999999, rows).astype(np.int64),
@@ -34,7 +45,8 @@ def generate_market_data(rows=100000):
         'premium': np.random.uniform(1.0, 10.0, rows).round(4),
         'status': 'Initial',
         'underlyingId': np.random.choice(['12620', '13440', '15500'], rows),
-        'execTime': [d.strftime(f"%Y-%m-%d{suffix}") for d in base_dates],
+        # Format: 2024-01-16T17:17:10.206+01:00[Europe/Paris]
+        'execTime': [t.strftime(f"%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}{suffix}" for t in exec_times],
         'underlyingCurrency': 'EUR',
         'underlyingType': 'Stock',
         'underlyingName': '' # Populated below
