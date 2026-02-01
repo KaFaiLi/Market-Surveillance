@@ -6,7 +6,14 @@ from scipy.stats import zscore
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 
-def analyze_risk_and_export(df):
+def analyze_risk_and_export(df, visualize_ghost_risk=False):
+    """
+    Analyze trading risk and export results.
+    
+    Parameters:
+    - df: DataFrame with trading data
+    - visualize_ghost_risk: If True, create visualizations for ghost risk cases (default: False)
+    """
     df = df.copy()
     
     # 1. Reconstruct Trade Order from execTime
@@ -28,15 +35,38 @@ def analyze_risk_and_export(df):
     summary = df.groupby(group_cols).agg(
         max_intraday_exposure=('cumulative_pos', lambda x: x.abs().max()),
         eod_position=('cumulative_pos', 'last'),
-        trade_count=('dealId', 'count')
+        trade_count=('dealId', 'count'),
+        first_trade_time=('execTime_dt', 'min'),
+        last_trade_time=('execTime_dt', 'max')
     ).reset_index()
+    
+    # Calculate trading duration in minutes
+    summary['trading_duration_min'] = (summary['last_trade_time'] - summary['first_trade_time']).dt.total_seconds() / 60
     
     # Calculate Risk Ratio and Z-Score
     summary['risk_ratio'] = summary['max_intraday_exposure'] / (summary['eod_position'].abs() + 0.1)
     summary['z_score'] = zscore(summary['risk_ratio'])
     
-    # 4. Filter Outliers (Z-Score > 2)
-    outlier_summary = summary[summary['z_score'] > 2].sort_values(by='z_score', ascending=False)
+    # 4. Filter Outliers (Z-Score > 2) but exclude "ghost risk" scenarios
+    # Ghost risk: high intraday exposure with near-zero EOD position, but all trades in short time frame
+    # Define thresholds
+    GHOST_RISK_TIME_THRESHOLD_MIN = 5  # 5 minutes
+    GHOST_RISK_EOD_THRESHOLD = 100  # Near-zero position threshold
+    
+    outlier_summary = summary[summary['z_score'] > 2].copy()
+    
+    # Flag ghost risk scenarios
+    outlier_summary['is_ghost_risk'] = (
+        (outlier_summary['eod_position'].abs() <= GHOST_RISK_EOD_THRESHOLD) & 
+        (outlier_summary['trading_duration_min'] <= GHOST_RISK_TIME_THRESHOLD_MIN)
+    )
+    
+    # Separate real risk from ghost risk
+    real_outliers = outlier_summary[~outlier_summary['is_ghost_risk']].sort_values(by='z_score', ascending=False)
+    ghost_risk_cases = outlier_summary[outlier_summary['is_ghost_risk']].sort_values(by='z_score', ascending=False)
+    
+    # Use real outliers for main analysis
+    outlier_summary = real_outliers
     
     # 5. Extract Detailed Trade Logs for these specific outliers only
     # This helps in auditing exactly what happened on those risky days
@@ -46,31 +76,51 @@ def analyze_risk_and_export(df):
         how='inner'
     )
     
-    # 6. Save to two CSV files in output folder
+    # 6. Save to CSV files in output folder
     output_dir = 'output'
     os.makedirs(output_dir, exist_ok=True)
     summary_csv = os.path.join(output_dir, 'Outlier_Summary.csv')
     details_csv = os.path.join(output_dir, 'Detailed_Outlier.csv')
+    ghost_risk_csv = os.path.join(output_dir, 'Ghost_Risk_Summary.csv')
+    
     if outlier_summary.empty:
-        print("No outlier groups found; no CSVs written.")
-        return outlier_summary
+        print("No real risk outlier groups found.")
+    else:
+        outlier_summary.to_csv(summary_csv, index=False)
+        outlier_details.to_csv(details_csv, index=False)
+        print(f"Analysis complete. {len(outlier_summary)} real risk outlier groups found.")
+        print(f"Results saved to: {summary_csv} and {details_csv}")
     
-    outlier_summary.to_csv(summary_csv, index=False)
-    outlier_details.to_csv(details_csv, index=False)
+    # Save ghost risk cases separately
+    if not ghost_risk_cases.empty:
+        ghost_risk_cases.to_csv(ghost_risk_csv, index=False)
+        print(f"\n{len(ghost_risk_cases)} 'ghost risk' groups detected (high intraday exposure, near-zero EOD, short duration).")
+        print(f"Ghost risk cases saved to: {ghost_risk_csv}")
     
-    print(f"Analysis complete. {len(outlier_summary)} outlier groups found.")
-    print(f"Results saved to: {summary_csv} and {details_csv}")
+    # 7. Create visualizations for real risk outlier groups
+    if not outlier_summary.empty:
+        visualize_outlier_groups(outlier_details, outlier_summary, output_dir, is_ghost_risk=False)
     
-    # 7. Create visualizations for each outlier group
-    visualize_outlier_groups(outlier_details, outlier_summary, output_dir)
+    # 8. Optionally create visualizations for ghost risk cases
+    if visualize_ghost_risk and not ghost_risk_cases.empty:
+        ghost_details = df.merge(
+            ghost_risk_cases[group_cols + ['z_score', 'risk_ratio']],
+            on=group_cols,
+            how='inner'
+        )
+        print(f"\nCreating visualizations for {len(ghost_risk_cases)} ghost risk cases...")
+        visualize_outlier_groups(ghost_details, ghost_risk_cases, output_dir, is_ghost_risk=True)
     
     return outlier_summary
 
-def visualize_outlier_groups(outlier_details, outlier_summary, output_dir):
+def visualize_outlier_groups(outlier_details, outlier_summary, output_dir, is_ghost_risk=False):
     """
     Create bar plot visualizations for each outlier group showing:
     - Quantity traded over time (bars)
     - Trending cumulative position line
+    
+    Parameters:
+    - is_ghost_risk: If True, adds 'ghost_' prefix to filenames
     """
     if outlier_details.empty:
         return
@@ -142,8 +192,12 @@ def visualize_outlier_groups(outlier_details, outlier_summary, output_dir):
         plt.tight_layout()
         
         # Save figure with descriptive filename
-        filename = f"outlier_{row['tradeDate']}_{row['portfolioId']}_{row['underlyingId']}_{row['maturity']}.png"
-        filename = filename.replace('/', '-').replace(':', '-')  # Clean filename
+        # Clean date format: extract YYYY-MM-DD from timezone string
+        clean_date = str(row['tradeDate']).split('+')[0].split('T')[0].replace('-', '')
+        clean_maturity = str(row['maturity']).split('+')[0].split('T')[0].replace('-', '')
+        prefix = "ghost_risk_" if is_ghost_risk else "risk_outlier_"
+        filename = f"{prefix}{clean_date}_{row['portfolioId']}_{row['underlyingId']}_{clean_maturity}.png"
+        filename = filename.replace('/', '_').replace(':', '_').replace('[', '').replace(']', '')  # Clean filename
         filepath = os.path.join(output_dir, filename)
         plt.savefig(filepath, dpi=150, bbox_inches='tight')
         plt.close()
@@ -154,6 +208,10 @@ def visualize_outlier_groups(outlier_details, outlier_summary, output_dir):
 # Assuming your CSV exists from the previous steps
 try:
     df_trades = pd.read_csv('output/synthetic_trading_data.csv')
-    outliers = analyze_risk_and_export(df_trades)
+    
+    # Set to True to create visualizations for ghost risk cases
+    VISUALIZE_GHOST_RISK = False
+    
+    outliers = analyze_risk_and_export(df_trades, visualize_ghost_risk=VISUALIZE_GHOST_RISK)
 except FileNotFoundError:
     print("Error: 'synthetic_trading_data.csv' not found. Please ensure the file exists.")
