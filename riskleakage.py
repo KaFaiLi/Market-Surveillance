@@ -37,11 +37,15 @@ def analyze_risk_and_export(df, visualize_ghost_risk=False):
         eod_position=('cumulative_pos', 'last'),
         trade_count=('dealId', 'count'),
         first_trade_time=('execTime_dt', 'min'),
-        last_trade_time=('execTime_dt', 'max')
+        last_trade_time=('execTime_dt', 'max'),
+        unique_timestamps=('execTime_dt', 'nunique')
     ).reset_index()
     
     # Calculate trading duration in minutes
     summary['trading_duration_min'] = (summary['last_trade_time'] - summary['first_trade_time']).dt.total_seconds() / 60
+    
+    # Calculate percentage of trades with same timestamp (indicator of simultaneous offsetting trades)
+    summary['pct_trades_same_time'] = (summary['trade_count'] - summary['unique_timestamps']) / summary['trade_count'] * 100
     
     # Calculate Risk Ratio and Z-Score
     summary['risk_ratio'] = summary['max_intraday_exposure'] / (summary['eod_position'].abs() + 0.1)
@@ -49,16 +53,21 @@ def analyze_risk_and_export(df, visualize_ghost_risk=False):
     
     # 4. Filter Outliers (Z-Score > 2) but exclude "ghost risk" scenarios
     # Ghost risk: high intraday exposure with near-zero EOD position, but all trades in short time frame
+    # OR trades that happen at exact same time (simultaneous offsetting trades)
     # Define thresholds
     GHOST_RISK_TIME_THRESHOLD_MIN = 5  # 5 minutes
     GHOST_RISK_EOD_THRESHOLD = 100  # Near-zero position threshold
+    GHOST_RISK_SIMULTANEOUS_THRESHOLD = 30  # % of trades with same timestamp
     
     outlier_summary = summary[summary['z_score'] > 2].copy()
     
     # Flag ghost risk scenarios
     outlier_summary['is_ghost_risk'] = (
         (outlier_summary['eod_position'].abs() <= GHOST_RISK_EOD_THRESHOLD) & 
-        (outlier_summary['trading_duration_min'] <= GHOST_RISK_TIME_THRESHOLD_MIN)
+        (
+            (outlier_summary['trading_duration_min'] <= GHOST_RISK_TIME_THRESHOLD_MIN) |
+            (outlier_summary['pct_trades_same_time'] >= GHOST_RISK_SIMULTANEOUS_THRESHOLD)
+        )
     )
     
     # Separate real risk from ghost risk
