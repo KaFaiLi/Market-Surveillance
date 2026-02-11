@@ -1,226 +1,120 @@
-import os
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from scipy.stats import zscore
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+import os
 
-def analyze_risk_and_export(df, visualize_ghost_risk=False):
+def analyze_intraday_leakage_hourly(df, output_folder='hourly_risk_analysis'):
     """
-    Analyze trading risk and export results.
-    
-    Parameters:
-    - df: DataFrame with trading data
-    - visualize_ghost_risk: If True, create visualizations for ghost risk cases (default: False)
+    Analyzes intraday risk using Hourly Buckets.
+    Visualizes: Bars = Cumulative Position per Hour | Line = SOD to EOD Reference.
     """
+    os.makedirs(output_folder, exist_ok=True)
     df = df.copy()
-    
-    # 1. Reconstruct Trade Order from execTime
-    # Parse format: 2024-02-09T17:00:29.719+01:00[Europe/Paris]
-    # Extract datetime part before timezone (before '+' or '-' in offset)
-    df['execTime_dt'] = pd.to_datetime(df['execTime'].str.extract(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+)')[0])
-    df = df.sort_values(by=['execTime_dt', 'dealId']).reset_index(drop=True)
-    df['trade_order'] = np.arange(len(df))
-    
-    # 2. Risk Logic Calculations
-    group_cols = ['tradeDate', 'portfolioId', 'underlyingId', 'maturity']
-    
-    # Time diff and Position tracking
-    df['time_diff_min'] = df.groupby(group_cols)['execTime_dt'].diff().dt.total_seconds() / 60
+
+    # 1. Parse Time and Bucket by Hour
+    # Handles timestamps with timezone info like "2024-02-09T10:00:00+01:00"
+    df['execTime_dt'] = pd.to_datetime(df['execTime'].astype(str).str.split('[').str[0])
+    df['hour_bucket'] = df['execTime_dt'].dt.floor('h') # Rounds down to nearest hour
+
+    # 2. Calculate Signed Quantity
     df['signed_qty'] = np.where(df['way'].str.upper() == 'BUY', df['quantity'], -df['quantity'])
-    df['cumulative_pos'] = df.groupby(group_cols)['signed_qty'].cumsum()
-    
-    # 3. Create Group Summary for Z-Score
-    summary = df.groupby(group_cols).agg(
-        max_intraday_exposure=('cumulative_pos', lambda x: x.abs().max()),
-        eod_position=('cumulative_pos', 'last'),
-        trade_count=('dealId', 'count'),
-        first_trade_time=('execTime_dt', 'min'),
-        last_trade_time=('execTime_dt', 'max'),
-        unique_timestamps=('execTime_dt', 'nunique')
-    ).reset_index()
-    
-    # Calculate trading duration in minutes
-    summary['trading_duration_min'] = (summary['last_trade_time'] - summary['first_trade_time']).dt.total_seconds() / 60
-    
-    # Calculate percentage of trades with same timestamp (indicator of simultaneous offsetting trades)
-    summary['pct_trades_same_time'] = (summary['trade_count'] - summary['unique_timestamps']) / summary['trade_count'] * 100
-    
-    # Calculate Risk Ratio and Z-Score
-    summary['risk_ratio'] = summary['max_intraday_exposure'] / (summary['eod_position'].abs() + 0.1)
-    summary['z_score'] = zscore(summary['risk_ratio'])
-    
-    # 4. Filter Outliers (Z-Score > 2) but exclude "ghost risk" scenarios
-    # Ghost risk: high intraday exposure with near-zero EOD position, but all trades in short time frame
-    # OR trades that happen at exact same time (simultaneous offsetting trades)
-    # Define thresholds
-    GHOST_RISK_TIME_THRESHOLD_MIN = 5  # 5 minutes
-    GHOST_RISK_EOD_THRESHOLD = 100  # Near-zero position threshold
-    GHOST_RISK_SIMULTANEOUS_THRESHOLD = 30  # % of trades with same timestamp
-    
-    outlier_summary = summary[summary['z_score'] > 2].copy()
-    
-    # Flag ghost risk scenarios
-    outlier_summary['is_ghost_risk'] = (
-        (outlier_summary['eod_position'].abs() <= GHOST_RISK_EOD_THRESHOLD) & 
-        (
-            (outlier_summary['trading_duration_min'] <= GHOST_RISK_TIME_THRESHOLD_MIN) |
-            (outlier_summary['pct_trades_same_time'] >= GHOST_RISK_SIMULTANEOUS_THRESHOLD)
-        )
-    )
-    
-    # Separate real risk from ghost risk
-    real_outliers = outlier_summary[~outlier_summary['is_ghost_risk']].sort_values(by='z_score', ascending=False)
-    ghost_risk_cases = outlier_summary[outlier_summary['is_ghost_risk']].sort_values(by='z_score', ascending=False)
-    
-    # Use real outliers for main analysis
-    outlier_summary = real_outliers
-    
-    # 5. Extract Detailed Trade Logs for these specific outliers only
-    # This helps in auditing exactly what happened on those risky days
-    outlier_details = df.merge(
-        outlier_summary[group_cols + ['z_score', 'risk_ratio']],
-        on=group_cols,
-        how='inner'
-    )
-    
-    # 6. Save to CSV files in output folder
-    output_dir = 'output'
-    os.makedirs(output_dir, exist_ok=True)
-    summary_csv = os.path.join(output_dir, 'Outlier_Summary.csv')
-    details_csv = os.path.join(output_dir, 'Detailed_Outlier.csv')
-    ghost_risk_csv = os.path.join(output_dir, 'Ghost_Risk_Summary.csv')
-    
-    if outlier_summary.empty:
-        print("No real risk outlier groups found.")
-    else:
-        outlier_summary.to_csv(summary_csv, index=False)
-        outlier_details.to_csv(details_csv, index=False)
-        print(f"Analysis complete. {len(outlier_summary)} real risk outlier groups found.")
-        print(f"Results saved to: {summary_csv} and {details_csv}")
-    
-    # Save ghost risk cases separately
-    if not ghost_risk_cases.empty:
-        ghost_risk_cases.to_csv(ghost_risk_csv, index=False)
-        print(f"\n{len(ghost_risk_cases)} 'ghost risk' groups detected (high intraday exposure, near-zero EOD, short duration).")
-        print(f"Ghost risk cases saved to: {ghost_risk_csv}")
-    
-    # 7. Create visualizations for real risk outlier groups
-    if not outlier_summary.empty:
-        visualize_outlier_groups(outlier_details, outlier_summary, output_dir, is_ghost_risk=False)
-    
-    # 8. Optionally create visualizations for ghost risk cases
-    if visualize_ghost_risk and not ghost_risk_cases.empty:
-        ghost_details = df.merge(
-            ghost_risk_cases[group_cols + ['z_score', 'risk_ratio']],
-            on=group_cols,
-            how='inner'
-        )
-        print(f"\nCreating visualizations for {len(ghost_risk_cases)} ghost risk cases...")
-        visualize_outlier_groups(ghost_details, ghost_risk_cases, output_dir, is_ghost_risk=True)
-    
-    return outlier_summary
 
-def visualize_outlier_groups(outlier_details, outlier_summary, output_dir, is_ghost_risk=False):
-    """
-    Create bar plot visualizations for each outlier group showing:
-    - Quantity traded over time (bars)
-    - Trending cumulative position line
+    # 3. Aggregate to Hourly Level
+    # We group by the standard keys AND the hour bucket
+    keys = ['tradeDate', 'portfolioId', 'underlyingId', 'maturity']
     
-    Parameters:
-    - is_ghost_risk: If True, adds 'ghost_' prefix to filenames
-    """
-    if outlier_details.empty:
-        return
+    # First, get the net change per hour
+    hourly_net = df.groupby(keys + ['hour_bucket'])['signed_qty'].sum().reset_index()
     
-    group_cols = ['tradeDate', 'portfolioId', 'underlyingId', 'maturity']
-    
-    # Iterate through each outlier group
-    for idx, row in outlier_summary.iterrows():
-        # Filter data for this specific group
-        mask = True
-        for col in group_cols:
-            mask &= (outlier_details[col] == row[col])
-        group_data = outlier_details[mask].copy()
-        
-        # Sort by execution time
-        group_data = group_data.sort_values('execTime_dt')
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=(14, 6))
-        
-        # Create bar plot - color by BUY (green) vs SELL (red)
-        colors = ['green' if w.upper() == 'BUY' else 'red' for w in group_data['way']]
-        bars = ax.bar(group_data['execTime_dt'], group_data['signed_qty'], 
-                      color=colors, alpha=0.7, width=0.0003, edgecolor='black', linewidth=0.5)
-        
-        # Add trending cumulative position line
-        ax.plot(group_data['execTime_dt'], group_data['cumulative_pos'], 
-                color='blue', linestyle='-', linewidth=2.5, marker='o', markersize=4,
-                label='Cumulative Position (Trending)', zorder=5)
-        
-        # Add horizontal reference line for EOD position
-        final_position = row['eod_position']
-        ax.axhline(y=final_position, color='orange', linestyle='--', linewidth=2, 
-                   label=f'EOD Position: {final_position:.0f}', zorder=4)
-        
-        # Add zero line for reference
-        ax.axhline(y=0, color='black', linestyle='-', linewidth=0.8, alpha=0.5)
-        
-        # Format x-axis to show time
-        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-        ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-        plt.xticks(rotation=45, ha='right')
-        
-        # Labels and title
-        ax.set_xlabel('Time of Day', fontsize=12, fontweight='bold')
-        ax.set_ylabel('Position / Quantity', fontsize=12, fontweight='bold')
-        
-        title = f"Outlier Group: {row['tradeDate']} | Portfolio: {row['portfolioId']} | "
-        title += f"Underlying: {row['underlyingId']} | Maturity: {row['maturity']}\n"
-        title += f"Risk Ratio: {row['risk_ratio']:.2f} | Z-Score: {row['z_score']:.2f}"
-        ax.set_title(title, fontsize=13, fontweight='bold', pad=20)
-        
-        # Add legend
-        from matplotlib.patches import Patch
-        legend_elements = [
-            Patch(facecolor='green', alpha=0.7, label='BUY'),
-            Patch(facecolor='red', alpha=0.7, label='SELL'),
-            plt.Line2D([0], [0], color='blue', linestyle='-', linewidth=2.5, marker='o',
-                      label='Cumulative Position (Trending)'),
-            plt.Line2D([0], [0], color='orange', linestyle='--', linewidth=2,
-                      label=f'EOD Position: {final_position:.0f}')
-        ]
-        ax.legend(handles=legend_elements, loc='upper left', fontsize=10)
-        
-        # Add grid
-        ax.grid(True, alpha=0.3, linestyle=':', axis='y')
-        
-        # Tight layout
-        plt.tight_layout()
-        
-        # Save figure with descriptive filename
-        # Clean date format: extract YYYY-MM-DD from timezone string
-        clean_date = str(row['tradeDate']).split('+')[0].split('T')[0].replace('-', '')
-        clean_maturity = str(row['maturity']).split('+')[0].split('T')[0].replace('-', '')
-        prefix = "ghost_risk_" if is_ghost_risk else "risk_outlier_"
-        filename = f"{prefix}{clean_date}_{row['portfolioId']}_{row['underlyingId']}_{clean_maturity}.png"
-        filename = filename.replace('/', '_').replace(':', '_').replace('[', '').replace(']', '')  # Clean filename
-        filepath = os.path.join(output_dir, filename)
-        plt.savefig(filepath, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"Visualization saved: {filepath}")
+    # Sort is crucial for cumsum
+    hourly_net = hourly_net.sort_values(by=keys + ['hour_bucket'])
 
-# --- EXECUTION ---
-# Assuming your CSV exists from the previous steps
-try:
-    df_trades = pd.read_csv('output/synthetic_trading_data.csv')
+    # 4. Calculate Cumulative Position (The "Bar" Value)
+    # Assumes starting position is 0
+    hourly_net['cumulative_pos'] = hourly_net.groupby(keys)['signed_qty'].cumsum()
+
+    # 5. Analyze for Leakage and Generate CSV
+    summary_data = []
     
-    # Set to True to create visualizations for ghost risk cases
-    VISUALIZE_GHOST_RISK = False
+    # Iterate through each unique group (Portfolio/Underlying/Day)
+    for group_ids, group_df in hourly_net.groupby(keys):
+        trade_date, port, und, mat = group_ids
+        
+        # Define Reference Points
+        # Point 1: SOD (Start of Day) -> Position 0
+        sod_pos = 0
+        sod_time = group_df['hour_bucket'].min()
+        
+        # Point 2: EOD (End of Day) -> Final Cumulative Position
+        eod_pos = group_df['cumulative_pos'].iloc[-1]
+        eod_time = group_df['hour_bucket'].max()
+
+        # Risk Logic: Did we exceed the final EOD position significantly?
+        # We look at the absolute max exposure during the day vs absolute final position
+        max_exposure = group_df['cumulative_pos'].abs().max()
+        final_exposure = abs(eod_pos)
+        
+        # Leakage definition: Intraday peak is higher than EOD result
+        # We add a small buffer (e.g. 1% or 100 units) to ignore noise
+        is_leakage = max_exposure > (final_exposure + 100) 
+
+        summary_data.append({
+            'TradeDate': trade_date,
+            'Portfolio': port,
+            'Underlying': und,
+            'Maturity': mat,
+            'Max_Intraday_Pos': max_exposure,
+            'EOD_Pos_Abs': final_exposure,
+            'Net_EOD_Pos': eod_pos,
+            'Leakage_Detected': is_leakage,
+            'Leakage_Gap': max_exposure - final_exposure
+        })
+
+        # 6. Visualization (Strictly per your requirement)
+        if is_leakage:
+            fig, ax = plt.subplots(figsize=(10, 6))
+            
+            # BAR: Cumulative Position per Hour
+            # Note: We align 'edge' to align the bar starting at the hour
+            ax.bar(group_df['hour_bucket'], group_df['cumulative_pos'], 
+                   width=0.03, # Width approx 45 mins
+                   color='#1f77b4', alpha=0.8, label='Hourly Position (Cumulative)')
+            
+            # LINE: Only Two Points (SOD -> EOD)
+            # Plotting from First Hour timestamp to Last Hour timestamp
+            # Y values: 0 -> EOD Position
+            ax.plot([sod_time, eod_time], [0, eod_pos], 
+                    color='red', linewidth=3, linestyle='--', marker='o', 
+                    label='Net Flow Reference (SOD -> EOD)')
+
+            # Formatting
+            ax.set_title(f"Risk Leakage: {und} | {port} | {trade_date}\nIntraday Peak: {max_exposure:,.0f} vs EOD: {eod_pos:,.0f}", fontsize=11)
+            ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+            ax.axhline(0, color='black', linewidth=0.5)
+            ax.set_ylabel("Cumulative Position")
+            ax.legend()
+            ax.grid(axis='y', linestyle=':', alpha=0.5)
+            
+            # Save
+            safe_name = f"{trade_date}_{port}_{und}".replace(':','').replace('/','-')
+            plt.savefig(os.path.join(output_folder, f"Leakage_{safe_name}.png"))
+            plt.close()
+
+    # 7. Export Master CSV
+    results_df = pd.DataFrame(summary_data)
+    csv_path = os.path.join(output_folder, 'Full_Leakage_Report.csv')
+    results_df.to_csv(csv_path, index=False)
     
-    outliers = analyze_risk_and_export(df_trades, visualize_ghost_risk=VISUALIZE_GHOST_RISK)
-except FileNotFoundError:
-    print("Error: 'synthetic_trading_data.csv' not found. Please ensure the file exists.")
+    print(f"Processing complete.")
+    print(f"Total Groups: {len(results_df)}")
+    print(f"Leakage Cases Detected: {results_df['Leakage_Detected'].sum()}")
+    print(f"Report saved to: {csv_path}")
+
+    return results_df
+
+# --- How to run ---
+# df = pd.read_csv('your_data.csv')
+# analyze_intraday_leakage_hourly(df)
+df_trades = pd.read_csv("output/synthetic_trading_data.csv")
+analyze_intraday_leakage_hourly(df_trades)

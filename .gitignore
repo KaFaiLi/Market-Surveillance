@@ -1,8 +1,46 @@
+# OS files
 .DS_Store
+Thumbs.db
+
+# Python virtual environments
 .venv/
+venv/
+env/
+
+# Python cache files
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+
+# Project-specific output
 output/
 *.xlsx
 *.csv
 *.png
+
+# uv and pip
+.uv/
+.pip-cache/
+
+# Environment variables
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
