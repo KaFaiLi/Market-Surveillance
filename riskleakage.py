@@ -1,4 +1,5 @@
 import os
+from zoneinfo import ZoneInfo
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -14,25 +15,28 @@ def _currency_to_timezone(currency):
 
 
 def _parse_exec_time_to_utc(exec_time_value):
-    """Parse `execTime` string to timezone-aware UTC Timestamp.
+    """Parse `execTime` string to native timezone-aware UTC datetime.
 
     Input examples: `2024-02-09T17:00:29.719+01:00[Europe/Paris]`.
     """
     if pd.isna(exec_time_value):
-        return pd.NaT
+        return None
     # Drop optional bracketed zone suffix, keep ISO datetime + offset.
     raw_value = str(exec_time_value).split("[", 1)[0]
-    return pd.to_datetime(raw_value, errors="coerce", utc=True)
+    parsed_ts = pd.to_datetime(raw_value, errors="coerce", utc=True)
+    if pd.isna(parsed_ts):
+        return None
+    return parsed_ts.to_pydatetime()
 
 
 def _to_local_exec_time(exec_time_utc, local_timezone):
-    """Convert UTC timestamp to local market timezone when available."""
-    if pd.isna(exec_time_utc):
-        return pd.NaT
+    """Convert UTC datetime to local market native timezone-aware datetime."""
+    if exec_time_utc is None:
+        return None
     if not local_timezone:
         return exec_time_utc
     try:
-        return exec_time_utc.tz_convert(local_timezone)
+        return exec_time_utc.astimezone(ZoneInfo(local_timezone))
     except Exception:
         return exec_time_utc
 
@@ -78,7 +82,9 @@ def analyze_intraday_leakage_continuous(
         axis=1,
     )
     df["hour_bucket"] = df["execTime_parsed"].apply(
-        lambda ts: ts.floor("h") if pd.notna(ts) else pd.NaT
+        lambda ts: ts.replace(minute=0, second=0, microsecond=0)
+        if ts is not None
+        else None
     )
 
     # 2) Signed quantity.
@@ -99,7 +105,9 @@ def analyze_intraday_leakage_continuous(
     hourly_net["cumulative_pos"] = hourly_net.groupby(position_keys)[
         "signed_qty"
     ].cumsum()
-    hourly_net["execDate"] = hourly_net["hour_bucket"].dt.date
+    hourly_net["execDate"] = hourly_net["hour_bucket"].apply(
+        lambda ts: ts.date() if ts is not None else None
+    )
 
     # 5) Evaluate leakage per exec-date and position key.
     summary_data = []
