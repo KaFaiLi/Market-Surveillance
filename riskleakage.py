@@ -127,7 +127,12 @@ def analyze_intraday_leakage_continuous(
         leakage_gap = max_exposure - eod_exposure
         max_to_eod_ratio = max_exposure / (eod_exposure + 1e-9)
 
-        is_leakage = (max_exposure > (eod_exposure)) and (max_exposure != abs(sod_pos))
+        # Exclude fully flattened books at EOD (treated as intentional portfolio clearing).
+        is_leakage = (
+            eod_exposure != 0
+            and (max_exposure > eod_exposure)
+            and (max_exposure != abs(sod_pos))
+        )
 
         summary_data.append(
             {
