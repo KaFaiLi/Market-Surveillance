@@ -5,6 +5,7 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from prettytable import PrettyTable
 from market_close_times import MARKET_CLOSE_TIMES
 
 
@@ -41,6 +42,166 @@ def _to_local_exec_time(exec_time_utc, local_timezone):
         return exec_time_utc
 
 
+def _write_audit_report(
+    results_df: pd.DataFrame,
+    flagged_trades_df: pd.DataFrame,
+    report_path: str,
+) -> None:
+    """Write a formatted auditor-ready report to *report_path* (plain text).
+
+    Sections
+    --------
+    1. Surveillance Overview – headline counts and rates.
+    2. Leakage Metric Statistics – min/max/mean/median for key risk measures.
+    3. Flagged Cases Detail – one row per leakage group, sorted by Leakage_Gap.
+    4. Flagged Trades Summary – trade count and gross signed qty per leakage group.
+    """
+    leakage_df = results_df[results_df["Leakage_Detected"]].copy()
+    total_groups = len(results_df)
+    total_leakage = len(leakage_df)
+    leakage_rate = (total_leakage / total_groups * 100) if total_groups else 0.0
+
+    sep = "=" * 90
+
+    with open(report_path, "w", encoding="utf-8") as fh:
+
+        def w(*args, **kwargs):
+            kwargs.setdefault("file", fh)
+            print(*args, **kwargs)
+
+        # ------------------------------------------------------------------
+        # Section 1: Surveillance Overview
+        # ------------------------------------------------------------------
+        w(f"\n{sep}")
+        w("  INTRADAY RISK LEAKAGE – AUDIT REPORT")
+        w(sep)
+
+        t1 = PrettyTable()
+        t1.field_names = ["Metric", "Value"]
+        t1.align["Metric"] = "l"
+        t1.align["Value"] = "r"
+        t1.add_rows([
+            ["Total Daily Position Groups",         f"{total_groups:,}"],
+            ["Leakage Cases Detected",               f"{total_leakage:,}"],
+            ["Leakage Rate",                         f"{leakage_rate:.2f} %"],
+            ["Portfolios Affected",                  str(leakage_df["Portfolio"].nunique()) if not leakage_df.empty else "0"],
+            ["Underlyings Affected",                 str(leakage_df["Underlying"].nunique()) if not leakage_df.empty else "0"],
+            ["Earliest Leakage Date",                str(leakage_df["ExecDate"].min()) if not leakage_df.empty else "N/A"],
+            ["Latest Leakage Date",                  str(leakage_df["ExecDate"].max()) if not leakage_df.empty else "N/A"],
+            ["Flagged Original Trades",              f"{len(flagged_trades_df):,}"],
+        ])
+        w(t1)
+
+        if leakage_df.empty:
+            w("  No leakage cases – nothing further to report.")
+            w(sep)
+            return
+
+        # ------------------------------------------------------------------
+        # Section 2: Leakage Metric Statistics
+        # ------------------------------------------------------------------
+        w(f"\n{sep}")
+        w("  LEAKAGE METRIC STATISTICS  (flagged groups only)")
+        w(sep)
+
+        metrics = [
+            "SOD_Position",
+            "EOD_Position",
+            "Max_Intraday_Position",
+            "Leakage_Gap",
+            "Max_to_EOD_Ratio",
+        ]
+        t2 = PrettyTable()
+        t2.field_names = ["Metric", "Min", "Max", "Mean", "Median"]
+        for col in ["Min", "Max", "Mean", "Median"]:
+            t2.align[col] = "r"
+        t2.align["Metric"] = "l"
+        for m in metrics:
+            series = leakage_df[m]
+            t2.add_row([
+                m,
+                f"{series.min():>15,.2f}",
+                f"{series.max():>15,.2f}",
+                f"{series.mean():>15,.2f}",
+                f"{series.median():>15,.2f}",
+            ])
+        w(t2)
+
+        # ------------------------------------------------------------------
+        # Section 3: Flagged Cases Detail
+        # ------------------------------------------------------------------
+        w(f"\n{sep}")
+        w("  FLAGGED CASES DETAIL  (sorted by Leakage_Gap descending)")
+        w(sep)
+
+        sorted_leakage = leakage_df.sort_values("Leakage_Gap", ascending=False).reset_index(drop=True)
+        t3 = PrettyTable()
+        t3.field_names = [
+            "#", "ExecDate", "Portfolio", "Underlying", "Maturity",
+            "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio",
+        ]
+        for col in ["SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio"]:
+            t3.align[col] = "r"
+        for i, row in sorted_leakage.iterrows():
+            t3.add_row([
+                i + 1,
+                row["ExecDate"],
+                row["Portfolio"],
+                row["Underlying"],
+                row["Maturity"],
+                f"{row['SOD_Position']:>12,.0f}",
+                f"{row['EOD_Position']:>12,.0f}",
+                f"{row['Max_Intraday_Position']:>12,.0f}",
+                f"{row['Leakage_Gap']:>12,.2f}",
+                f"{row['Max_to_EOD_Ratio']:>10,.4f}",
+            ])
+        w(t3)
+
+        # ------------------------------------------------------------------
+        # Section 4: Flagged Trades Summary per Leakage Group
+        # ------------------------------------------------------------------
+        if not flagged_trades_df.empty:
+            w(f"\n{sep}")
+            w("  FLAGGED TRADES SUMMARY  (original trades mapped to leakage groups)")
+            w(sep)
+
+            grp_summary = (
+                flagged_trades_df.groupby(["ExecDate", "Portfolio", "Underlying", "Maturity"])
+                .agg(
+                    Trade_Count=("signed_qty", "count"),
+                    Gross_Buy_Qty=("signed_qty", lambda x: x[x > 0].sum()),
+                    Gross_Sell_Qty=("signed_qty", lambda x: x[x < 0].sum()),
+                    Net_Qty=("signed_qty", "sum"),
+                )
+                .reset_index()
+                .sort_values("Trade_Count", ascending=False)
+            )
+
+            t4 = PrettyTable()
+            t4.field_names = [
+                "ExecDate", "Portfolio", "Underlying", "Maturity",
+                "Trades", "Gross Buy", "Gross Sell", "Net Qty",
+            ]
+            for col in ["Trades", "Gross Buy", "Gross Sell", "Net Qty"]:
+                t4.align[col] = "r"
+            for _, row in grp_summary.iterrows():
+                t4.add_row([
+                    row["ExecDate"],
+                    row["Portfolio"],
+                    row["Underlying"],
+                    row["Maturity"],
+                    f"{int(row['Trade_Count']):,}",
+                    f"{row['Gross_Buy_Qty']:>14,.0f}",
+                    f"{row['Gross_Sell_Qty']:>14,.0f}",
+                    f"{row['Net_Qty']:>14,.0f}",
+                ])
+            w(t4)
+
+        w(f"\n{sep}")
+        w("  END OF AUDIT REPORT")
+        w(sep + "\n")
+
+
 def analyze_intraday_leakage_continuous(
     df,
     output_folder="hourly_risk_analysis_continuous",
@@ -61,7 +222,10 @@ def analyze_intraday_leakage_continuous(
     max_plots: Optional hard cap on the number of plots to generate.
 
     Returns:
-    pd.DataFrame with one row per grouped exec-date/position key.
+    Tuple[pd.DataFrame, pd.DataFrame]:
+        - results_df: one row per grouped exec-date/position key with leakage metrics.
+        - flagged_trades_df: original trade rows that belong to flagged leakage groups,
+          enriched with leakage metrics and exec-date columns.
     """
     os.makedirs(output_folder, exist_ok=True)
     df = df.copy()
@@ -227,21 +391,86 @@ def analyze_intraday_leakage_continuous(
             plt.close()
             plotted_count += 1
 
-    # 7) Export report.
+    # 7) Map flagged leakage cases back to the original trade-level DataFrame.
+    leakage_summary = results_df[results_df["Leakage_Detected"]].copy()
+
+    # Build a lookup set of (execDate, portfolioId, underlyingId, maturity).
+    leakage_keys = set(
+        zip(
+            leakage_summary["ExecDate"],
+            leakage_summary["Portfolio"],
+            leakage_summary["Underlying"],
+            leakage_summary["Maturity"],
+        )
+    )
+
+    # Enrich the working df with execDate (already has execTime_parsed & signed_qty).
+    df["execDate"] = df["execTime_parsed"].apply(
+        lambda ts: ts.date() if ts is not None else None
+    )
+
+    # Filter original trades that belong to a flagged group.
+    flagged_mask = df.apply(
+        lambda row: (
+            row["execDate"],
+            row["portfolioId"],
+            row["underlyingId"],
+            row["maturity"],
+        )
+        in leakage_keys,
+        axis=1,
+    )
+    flagged_trades_df = df[flagged_mask].copy()
+
+    # Merge leakage metrics into the flagged trades for full context.
+    leakage_merge = leakage_summary.rename(
+        columns={
+            "ExecDate": "execDate",
+            "Portfolio": "portfolioId",
+            "Underlying": "underlyingId",
+            "Maturity": "maturity",
+        }
+    )[["execDate", "portfolioId", "underlyingId", "maturity",
+       "SOD_Position", "EOD_Position", "Max_Intraday_Position",
+       "Leakage_Gap", "Max_to_EOD_Ratio"]]
+
+    flagged_trades_df = flagged_trades_df.merge(
+        leakage_merge,
+        on=["execDate", "portfolioId", "underlyingId", "maturity"],
+        how="left",
+    )
+
+    # Rename for report-friendly column names.
+    flagged_trades_df = flagged_trades_df.rename(
+        columns={
+            "execDate": "ExecDate",
+            "portfolioId": "Portfolio",
+            "underlyingId": "Underlying",
+            "maturity": "Maturity",
+        }
+    )
+
+    # 8) Export reports.
     csv_path = os.path.join(output_folder, "Full_Leakage_Report_Continuous.csv")
     results_df.to_csv(csv_path, index=False)
 
-    print("Processing complete.")
-    print(f"Total Daily Groups: {len(results_df)}")
-    print(f"Leakage Cases Detected: {results_df['Leakage_Detected'].sum()}")
-    print(f"Plots Generated: {plotted_count}")
-    print(f"Report saved to: {csv_path}")
+    flagged_trades_csv = os.path.join(output_folder, "Leakage_Flagged_Trades.csv")
+    flagged_trades_df.to_csv(flagged_trades_csv, index=False)
 
-    return results_df
+    # 9) Write auditor report to text file.
+    audit_report_path = os.path.join(output_folder, "Audit_Report.txt")
+    _write_audit_report(results_df, flagged_trades_df, audit_report_path)
+
+    print(f"Plots Generated              : {plotted_count}")
+    print(f"Full Report                  : {csv_path}")
+    print(f"Flagged Trades CSV           : {flagged_trades_csv}")
+    print(f"Audit Report TXT             : {audit_report_path}")
+
+    return results_df, flagged_trades_df
 
 
 if __name__ == "__main__":
     df_trades = pd.read_csv("output/synthetic_trading_data.csv")
-    analyze_intraday_leakage_continuous(
+    results, flagged = analyze_intraday_leakage_continuous(
         df_trades, plot_top_pct=5, plot_metric="Max_to_EOD_Ratio", max_plots=20
     )

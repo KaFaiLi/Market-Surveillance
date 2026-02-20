@@ -7,5 +7,6 @@ requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.10.8",
     "pandas>=3.0.0",
+    "prettytable>=3.10.0",
     "scipy>=1.17.0",
 ]

@@ -32,6 +32,7 @@ output/
 *.xlsx
 *.csv
 *.png
+*.txt
 
 # uv and pip
 .uv/
