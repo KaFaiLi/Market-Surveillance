@@ -39,7 +39,14 @@ def validate_leakage_calculations(
 
     # Filter to leakage-detected groups only
     leakage_report = report_df[report_df["Leakage_Detected"]].copy()
-    print(f"Found {len(leakage_report):,} leakage-detected groups\n")
+    if "Action" in leakage_report.columns:
+        leakage_report = leakage_report[leakage_report["Action"] != "suppress"].copy()
+        print(
+            f"Found {len(leakage_report):,} escalated leakage groups "
+            f"(excluding suppressed candidates)\n"
+        )
+    else:
+        print(f"Found {len(leakage_report):,} leakage-detected groups\n")
 
     if leakage_report.empty:
         print("No leakage detected - nothing to validate.")
