@@ -9,6 +9,7 @@ def generate_market_data(rows=100000):
     portfolios = ["CTM_SINGLFUT", "CTM_EQUITY", "CTM_DERIV"]
     accounts = ["CTM_IM", "CTM_MARGIN"]
     assets = ["BANCA-INTESA_X", "ENI_S.p.A", "UNICREDIT_X"]
+    currencies = ["EUR", "USD", "GBP", "JPY", "CHF", "CAD", "AUD"]
 
     # Common Suffix
     suffix = "+01:00[Europe/Paris]"
@@ -48,7 +49,7 @@ def generate_market_data(rows=100000):
         "quantity": np.random.uniform(1000, 5000000, rows).round(0),
         "assetName": np.random.choice(assets, rows),
         "broker_type": "LCHLTDBAFIGB",
-        "currencyId": "EUR",
+        "currencyId": np.random.choice(currencies, rows),
         "maturity": f"1970-01-01{suffix}",
         "premium": np.random.uniform(1.0, 10.0, rows).round(4),
         "status": "Initial",
@@ -58,7 +59,7 @@ def generate_market_data(rows=100000):
             t.strftime(f"%Y-%m-%dT%H:%M:%S.") + f"{t.microsecond // 1000:03d}{suffix}"
             for t in exec_times
         ],
-        "underlyingCurrency": "EUR",
+        "underlyingCurrency": np.random.choice(currencies, rows),
         "underlyingType": "Stock",
         "underlyingName": "",  # Populated below
     }
