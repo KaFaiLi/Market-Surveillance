@@ -105,6 +105,7 @@ def _write_audit_report(
         w(sep)
 
         metrics = [
+            "Prior_EOD_Position",
             "SOD_Position",
             "EOD_Position",
             "Max_Intraday_Position",
@@ -138,9 +139,9 @@ def _write_audit_report(
         t3 = PrettyTable()
         t3.field_names = [
             "#", "ExecDate", "Portfolio", "Underlying", "Maturity",
-            "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio",
+            "Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio",
         ]
-        for col in ["SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio"]:
+        for col in ["Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio"]:
             t3.align[col] = "r"
         for i, row in sorted_leakage.iterrows():
             t3.add_row([
@@ -149,6 +150,7 @@ def _write_audit_report(
                 row["Portfolio"],
                 row["Underlying"],
                 row["Maturity"],
+                f"{row['Prior_EOD_Position']:>12,.0f}",
                 f"{row['SOD_Position']:>12,.0f}",
                 f"{row['EOD_Position']:>12,.0f}",
                 f"{row['Max_Intraday_Position']:>12,.0f}",
@@ -285,6 +287,8 @@ def analyze_intraday_leakage_continuous(
 
         sod_pos = group_df["cumulative_pos"].iloc[0]
         eod_pos = group_df["cumulative_pos"].iloc[-1]
+        # Position entering the day before any first-hour trading (prior EOD carry-over).
+        prior_eod_pos = sod_pos - group_df["signed_qty"].iloc[0]
 
         max_exposure = group_df["cumulative_pos"].abs().max()
         eod_exposure = abs(eod_pos)
@@ -304,6 +308,7 @@ def analyze_intraday_leakage_continuous(
                 "Portfolio": port,
                 "Underlying": und,
                 "Maturity": mat,
+                "Prior_EOD_Position": prior_eod_pos,
                 "SOD_Position": sod_pos,
                 "EOD_Position": eod_pos,
                 "Max_Intraday_Position": max_exposure,
@@ -431,8 +436,8 @@ def analyze_intraday_leakage_continuous(
             "Maturity": "maturity",
         }
     )[["execDate", "portfolioId", "underlyingId", "maturity",
-       "SOD_Position", "EOD_Position", "Max_Intraday_Position",
-       "Leakage_Gap", "Max_to_EOD_Ratio"]]
+       "Prior_EOD_Position", "SOD_Position", "EOD_Position",
+       "Max_Intraday_Position", "Leakage_Gap", "Max_to_EOD_Ratio"]]
 
     flagged_trades_df = flagged_trades_df.merge(
         leakage_merge,
