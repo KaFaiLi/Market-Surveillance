@@ -42,6 +42,163 @@ def _to_local_exec_time(exec_time_utc, local_timezone):
         return exec_time_utc
 
 
+def _build_fp_config(fp_config=None):
+    """Return false-positive handling configuration with optional overrides."""
+    config = {
+        "eod_abs_min": 1_000.0,
+        "eod_to_sod_ratio_min": 0.05,
+        "peak_first_hour_tolerance_hours": 1.0,
+        "peak_equals_sod_rel_tol": 0.02,
+        "decreasing_flow_min_reduction": 0.20,
+        "new_risk_abs_min": 5_000.0,
+        "new_risk_to_sod_min": 0.10,
+        "operational_review_gap_max": 25_000.0,
+        "operational_review_ratio_max": 2.0,
+        "adaptive_scale_floor": 0.5,
+        "adaptive_scale_cap": 3.0,
+    }
+    if fp_config:
+        config.update(fp_config)
+    return config
+
+
+def _clip_scale(value, lower, upper):
+    return float(np.clip(value, lower, upper))
+
+
+def _compute_adaptive_scales(results_df, config):
+    """Compute per-row adaptive scaling based on underlying and portfolio size."""
+    if results_df.empty:
+        return pd.Series(dtype=float)
+
+    under_avg = (
+        results_df.groupby("Underlying")["EOD_Position"]
+        .apply(lambda x: x.abs().mean())
+        .replace(0, np.nan)
+    )
+    port_avg = (
+        results_df.groupby("Portfolio")["Max_Intraday_Position"]
+        .mean()
+        .replace(0, np.nan)
+    )
+
+    under_median = float(under_avg.median()) if not under_avg.dropna().empty else 1.0
+    port_median = float(port_avg.median()) if not port_avg.dropna().empty else 1.0
+    if under_median == 0:
+        under_median = 1.0
+    if port_median == 0:
+        port_median = 1.0
+
+    floor = config["adaptive_scale_floor"]
+    cap = config["adaptive_scale_cap"]
+
+    def _scale_row(row):
+        u_avg = under_avg.get(row["Underlying"], under_median)
+        p_avg = port_avg.get(row["Portfolio"], port_median)
+
+        if pd.isna(u_avg):
+            u_avg = under_median
+        if pd.isna(p_avg):
+            p_avg = port_median
+
+        scale = np.sqrt((u_avg / under_median) * (p_avg / port_median))
+        return _clip_scale(scale, floor, cap)
+
+    return results_df.apply(_scale_row, axis=1)
+
+
+def _classify_leakage_false_positive(row, group_df, config):
+    """Classify a leakage case into suppress/operational-review/investigate."""
+    leakage_detected = bool(row["Leakage_Detected"])
+    if not leakage_detected:
+        return {
+            "Likely_FP": False,
+            "FP_Reasons": "",
+            "Action": "none",
+            "Incremental_Intraday_Risk": 0.0,
+        }
+
+    abs_sod = abs(float(row["SOD_Position"]))
+    abs_eod = abs(float(row["EOD_Position"]))
+    max_exposure = float(row["Max_Intraday_Position"])
+    incremental_risk = max(0.0, max_exposure - abs_sod)
+
+    eod_abs_min = float(row["effective_eod_abs_min"])
+    new_risk_abs_min = float(row["effective_new_risk_abs_min"])
+    operational_review_gap_max = float(row["effective_operational_review_gap_max"])
+
+    eod_to_sod_ratio = abs_eod / (abs_sod + 1e-9)
+    low_eod = (abs_eod <= eod_abs_min) or (
+        eod_to_sod_ratio <= config["eod_to_sod_ratio_min"]
+    )
+
+    peak_idx = group_df["cumulative_pos"].abs().idxmax()
+    peak_time = group_df.loc[peak_idx, "hour_bucket"]
+    first_time = group_df["hour_bucket"].iloc[0]
+    peak_at_first_hour = bool(
+        abs((peak_time - first_time).total_seconds())
+        <= (config["peak_first_hour_tolerance_hours"] * 3600)
+    )
+
+    peak_equals_sod = bool(
+        np.isclose(
+            max_exposure,
+            abs_sod,
+            rtol=config["peak_equals_sod_rel_tol"],
+            atol=1e-9,
+        )
+    )
+
+    decreasing_net_flow = bool(
+        abs_eod <= abs_sod * (1.0 - config["decreasing_flow_min_reduction"])
+    )
+
+    new_risk_ratio = incremental_risk / (abs_sod + 1e-9)
+    tiny_new_risk = (incremental_risk <= new_risk_abs_min) or (
+        new_risk_ratio <= config["new_risk_to_sod_min"]
+    )
+
+    reason_flags = {
+        "low_eod": low_eod,
+        "peak_at_first_hour": peak_at_first_hour,
+        "peak_equals_sod": peak_equals_sod,
+        "decreasing_net_flow": decreasing_net_flow,
+        "tiny_new_risk": tiny_new_risk,
+    }
+
+    behavioral_confirmations = any(
+        reason_flags[k]
+        for k in [
+            "peak_at_first_hour",
+            "peak_equals_sod",
+            "decreasing_net_flow",
+            "tiny_new_risk",
+        ]
+    )
+
+    likely_fp = low_eod and behavioral_confirmations
+    reasons = [code for code, enabled in reason_flags.items() if enabled]
+
+    if likely_fp:
+        action = "suppress"
+    else:
+        low_materiality = (
+            float(row["Leakage_Gap"]) <= operational_review_gap_max
+            or float(row["Max_to_EOD_Ratio"]) <= config["operational_review_ratio_max"]
+            or incremental_risk <= (new_risk_abs_min * 1.5)
+        )
+        action = "operational-review" if low_materiality else "investigate"
+        if low_materiality:
+            reasons.append("low_materiality")
+
+    return {
+        "Likely_FP": likely_fp,
+        "FP_Reasons": "|".join(reasons),
+        "Action": action,
+        "Incremental_Intraday_Risk": incremental_risk,
+    }
+
+
 def _write_audit_report(
     results_df: pd.DataFrame,
     flagged_trades_df: pd.DataFrame,
@@ -60,6 +217,11 @@ def _write_audit_report(
     total_groups = len(results_df)
     total_leakage = len(leakage_df)
     leakage_rate = (total_leakage / total_groups * 100) if total_groups else 0.0
+
+    suppressed_df = leakage_df[leakage_df["Action"] == "suppress"].copy() if "Action" in leakage_df.columns else pd.DataFrame()
+    operational_df = leakage_df[leakage_df["Action"] == "operational-review"].copy() if "Action" in leakage_df.columns else pd.DataFrame()
+    investigate_df = leakage_df[leakage_df["Action"] == "investigate"].copy() if "Action" in leakage_df.columns else leakage_df.copy()
+    suppression_rate = (len(suppressed_df) / total_leakage * 100) if total_leakage else 0.0
 
     sep = "=" * 90
 
@@ -84,6 +246,10 @@ def _write_audit_report(
             ["Total Daily Position Groups",         f"{total_groups:,}"],
             ["Leakage Cases Detected",               f"{total_leakage:,}"],
             ["Leakage Rate",                         f"{leakage_rate:.2f} %"],
+            ["Suppressed (Likely FP)",               f"{len(suppressed_df):,}"],
+            ["Suppression Rate",                     f"{suppression_rate:.2f} %"],
+            ["Operational Review Cases",             f"{len(operational_df):,}"],
+            ["Investigate Cases",                    f"{len(investigate_df):,}"],
             ["Portfolios Affected",                  str(leakage_df["Portfolio"].nunique()) if not leakage_df.empty else "0"],
             ["Underlyings Affected",                 str(leakage_df["Underlying"].nunique()) if not leakage_df.empty else "0"],
             ["Earliest Leakage Date",                str(leakage_df["ExecDate"].min()) if not leakage_df.empty else "N/A"],
@@ -140,9 +306,11 @@ def _write_audit_report(
         t3.field_names = [
             "#", "ExecDate", "Portfolio", "Underlying", "Maturity",
             "Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio",
+            "Likely_FP", "Action", "FP_Reasons",
         ]
         for col in ["Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio"]:
             t3.align[col] = "r"
+        t3.align["FP_Reasons"] = "l"
         for i, row in sorted_leakage.iterrows():
             t3.add_row([
                 i + 1,
@@ -156,8 +324,42 @@ def _write_audit_report(
                 f"{row['Max_Intraday_Position']:>12,.0f}",
                 f"{row['Leakage_Gap']:>12,.2f}",
                 f"{row['Max_to_EOD_Ratio']:>10,.4f}",
+                "Y" if bool(row.get("Likely_FP", False)) else "N",
+                row.get("Action", "investigate"),
+                row.get("FP_Reasons", ""),
             ])
         w(t3)
+
+        # ------------------------------------------------------------------
+        # Section 3b: FP Reason Distribution (governance KPI)
+        # ------------------------------------------------------------------
+        if "FP_Reasons" in leakage_df.columns:
+            reason_tokens = (
+                leakage_df["FP_Reasons"]
+                .fillna("")
+                .str.split("|")
+                .explode()
+                .str.strip()
+            )
+            reason_tokens = reason_tokens[reason_tokens != ""]
+            w(f"\n{sep}")
+            w("  FP REASON DISTRIBUTION")
+            w(sep)
+
+            if reason_tokens.empty:
+                w("  No FP reason codes assigned.")
+            else:
+                reason_dist = reason_tokens.value_counts().reset_index()
+                reason_dist.columns = ["Reason", "Count"]
+                t3b = PrettyTable()
+                t3b.field_names = ["Reason", "Count", "Pct of Leakage"]
+                t3b.align["Reason"] = "l"
+                t3b.align["Count"] = "r"
+                t3b.align["Pct of Leakage"] = "r"
+                for _, r in reason_dist.iterrows():
+                    pct = (r["Count"] / total_leakage * 100) if total_leakage else 0.0
+                    t3b.add_row([r["Reason"], f"{int(r['Count']):,}", f"{pct:.2f} %"])
+                w(t3b)
 
         # ------------------------------------------------------------------
         # Section 4: Flagged Trades Summary per Leakage Group
@@ -210,6 +412,8 @@ def analyze_intraday_leakage_continuous(
     plot_top_pct=5,
     plot_metric="Leakage_Gap",
     max_plots=None,
+    fp_config=None,
+    enable_adaptive_thresholds=True,
 ):
     """Analyze intraday position leakage from execution-level trades.
 
@@ -222,6 +426,9 @@ def analyze_intraday_leakage_continuous(
     plot_metric: Ranking metric for plot selection. One of
         `Leakage_Gap`, `Max_Intraday_Position`, `Max_to_EOD_Ratio`.
     max_plots: Optional hard cap on the number of plots to generate.
+    fp_config: Optional dictionary of false-positive thresholds.
+    enable_adaptive_thresholds: If True, scales absolute thresholds by
+        underlying and portfolio historical size proxies.
 
     Returns:
     Tuple[pd.DataFrame, pd.DataFrame]:
@@ -235,6 +442,7 @@ def analyze_intraday_leakage_continuous(
         raise ValueError("plot_top_pct must be between 0 and 100.")
     if max_plots is not None and max_plots < 0:
         raise ValueError("max_plots must be >= 0 when provided.")
+    config = _build_fp_config(fp_config)
 
     # 1) Parse execution timestamp and group by parsed-hour bucket.
     df["market_timezone"] = df.get(
@@ -320,6 +528,60 @@ def analyze_intraday_leakage_continuous(
 
     results_df = pd.DataFrame(summary_data)
 
+    if results_df.empty:
+        results_df["Likely_FP"] = []
+        results_df["FP_Reasons"] = []
+        results_df["Action"] = []
+        results_df["Incremental_Intraday_Risk"] = []
+        results_df["Adaptive_Threshold_Scale"] = []
+        results_df["effective_eod_abs_min"] = []
+        results_df["effective_new_risk_abs_min"] = []
+        results_df["effective_operational_review_gap_max"] = []
+    else:
+        if enable_adaptive_thresholds:
+            scale_series = _compute_adaptive_scales(results_df, config)
+        else:
+            scale_series = pd.Series(1.0, index=results_df.index)
+
+        results_df["Adaptive_Threshold_Scale"] = scale_series
+        results_df["effective_eod_abs_min"] = (
+            config["eod_abs_min"] * results_df["Adaptive_Threshold_Scale"]
+        )
+        results_df["effective_new_risk_abs_min"] = (
+            config["new_risk_abs_min"] * results_df["Adaptive_Threshold_Scale"]
+        )
+        results_df["effective_operational_review_gap_max"] = (
+            config["operational_review_gap_max"] * results_df["Adaptive_Threshold_Scale"]
+        )
+
+        classifications = []
+        for idx, row in results_df.iterrows():
+            group_ids = (
+                row["ExecDate"],
+                row["Portfolio"],
+                row["Underlying"],
+                row["Maturity"],
+            )
+            group_df = group_frames.get(group_ids)
+            if group_df is None or group_df.empty:
+                classifications.append(
+                    {
+                        "Likely_FP": False,
+                        "FP_Reasons": "",
+                        "Action": "none" if not bool(row["Leakage_Detected"]) else "investigate",
+                        "Incremental_Intraday_Risk": max(
+                            0.0,
+                            float(row["Max_Intraday_Position"]) - abs(float(row["SOD_Position"])),
+                        ),
+                    }
+                )
+                continue
+
+            classifications.append(_classify_leakage_false_positive(row, group_df, config))
+
+        class_df = pd.DataFrame(classifications, index=results_df.index)
+        results_df = pd.concat([results_df, class_df], axis=1)
+
     # 6) Plot only the highest-ranked flagged leakage groups.
     metric_candidates = {"Leakage_Gap", "Max_Intraday_Position", "Max_to_EOD_Ratio"}
     if plot_metric not in metric_candidates:
@@ -327,7 +589,9 @@ def analyze_intraday_leakage_continuous(
             f"Invalid plot_metric '{plot_metric}'. Use one of: {sorted(metric_candidates)}"
         )
 
-    leakage_df = results_df[results_df["Leakage_Detected"]].copy()
+    leakage_df = results_df[
+        (results_df["Leakage_Detected"]) & (results_df["Action"] == "investigate")
+    ].copy()
     plotted_count = 0
 
     if not leakage_df.empty and plot_top_pct > 0:
@@ -398,14 +662,15 @@ def analyze_intraday_leakage_continuous(
 
     # 7) Map flagged leakage cases back to the original trade-level DataFrame.
     leakage_summary = results_df[results_df["Leakage_Detected"]].copy()
+    escalated_summary = leakage_summary[leakage_summary["Action"] != "suppress"].copy()
+    suppressed_candidates = leakage_summary[leakage_summary["Action"] == "suppress"].copy()
 
-    # Build a lookup set of (execDate, portfolioId, underlyingId, maturity).
-    leakage_keys = set(
+    escalated_keys = set(
         zip(
-            leakage_summary["ExecDate"],
-            leakage_summary["Portfolio"],
-            leakage_summary["Underlying"],
-            leakage_summary["Maturity"],
+            escalated_summary["ExecDate"],
+            escalated_summary["Portfolio"],
+            escalated_summary["Underlying"],
+            escalated_summary["Maturity"],
         )
     )
 
@@ -414,7 +679,7 @@ def analyze_intraday_leakage_continuous(
         lambda ts: ts.date() if ts is not None else None
     )
 
-    # Filter original trades that belong to a flagged group.
+    # Filter original trades that belong to an escalated group.
     flagged_mask = df.apply(
         lambda row: (
             row["execDate"],
@@ -422,7 +687,7 @@ def analyze_intraday_leakage_continuous(
             row["underlyingId"],
             row["maturity"],
         )
-        in leakage_keys,
+        in escalated_keys,
         axis=1,
     )
     flagged_trades_df = df[flagged_mask].copy()
@@ -437,7 +702,8 @@ def analyze_intraday_leakage_continuous(
         }
     )[["execDate", "portfolioId", "underlyingId", "maturity",
        "Prior_EOD_Position", "SOD_Position", "EOD_Position",
-       "Max_Intraday_Position", "Leakage_Gap", "Max_to_EOD_Ratio"]]
+       "Max_Intraday_Position", "Leakage_Gap", "Max_to_EOD_Ratio",
+       "Incremental_Intraday_Risk", "Likely_FP", "FP_Reasons", "Action"]]
 
     flagged_trades_df = flagged_trades_df.merge(
         leakage_merge,
@@ -462,6 +728,9 @@ def analyze_intraday_leakage_continuous(
     flagged_trades_csv = os.path.join(output_folder, "Leakage_Flagged_Trades.csv")
     flagged_trades_df.to_csv(flagged_trades_csv, index=False)
 
+    suppressed_csv = os.path.join(output_folder, "Suppressed_Leakage_Candidates.csv")
+    suppressed_candidates.to_csv(suppressed_csv, index=False)
+
     # 9) Write auditor report to text file.
     audit_report_path = os.path.join(output_folder, "Audit_Report.txt")
     _write_audit_report(results_df, flagged_trades_df, audit_report_path)
@@ -469,6 +738,7 @@ def analyze_intraday_leakage_continuous(
     print(f"Plots Generated              : {plotted_count}")
     print(f"Full Report                  : {csv_path}")
     print(f"Flagged Trades CSV           : {flagged_trades_csv}")
+    print(f"Suppressed Candidates CSV    : {suppressed_csv}")
     print(f"Audit Report TXT             : {audit_report_path}")
 
     return results_df, flagged_trades_df
