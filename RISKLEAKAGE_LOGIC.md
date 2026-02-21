@@ -8,9 +8,9 @@ The redesign removes dependence on endpoint-ratio heuristics and fixed model thr
 
 Primary triage outcomes:
 
-- `investigate`
-- `operational-review`
-- `de-prioritize`
+- `high`
+- `medium`
+- `low`
 
 ---
 
@@ -76,10 +76,10 @@ No labels are required. No contamination or score-threshold tuning is required.
 
 8. **Trade mapping with alignment policy**
    - If `align_plots_with_exports=True`, exports only plotted groups.
-   - Else exports all escalated groups (`investigate` + `operational-review`).
+   - Else exports all escalated groups (`high` + `medium`).
 
 9. **Exports + reconciliation**
-   - Writes full report, flagged trades, de-prioritized candidates,
+   - Writes full report, flagged trades, low-priority candidates,
      selection manifest, and audit report.
    - Prints plot/export reconciliation summary.
 
@@ -168,9 +168,9 @@ Fallback behavior:
 
 Actions are assigned from `Risk_Percentile`:
 
-- `>= 95` → `investigate`
-- `>= 80 and < 95` → `operational-review`
-- `< 80` → `de-prioritize`
+- `>= 95` → `high`
+- `>= 80 and < 95` → `medium`
+- `< 80` → `low`
 
 These are policy bands on percentile rank, not model-fit thresholds.
 
@@ -198,7 +198,7 @@ The explainability statement is auto-generated and references percentile abnorma
 Candidate filter:
 
 - `Leakage_Detected == True`
-- `Action` in `plot_actions` (default: `("investigate",)`)
+- `Action` in `plot_actions` (default: `("high",)`)
 - `Leakage_Gap >= plot_min_gap`
 
 Selection:
@@ -224,7 +224,7 @@ Allowed plot metrics:
 `align_plots_with_exports` controls trade-level export scope:
 
 - `True` (default): `Leakage_Flagged_Trades.csv` contains plotted groups only.
-- `False`: `Leakage_Flagged_Trades.csv` contains all escalated groups (`investigate`, `operational-review`).
+- `False`: `Leakage_Flagged_Trades.csv` contains all escalated groups (`high`, `medium`).
 
 ---
 
