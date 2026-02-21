@@ -410,6 +410,9 @@ def analyze_intraday_leakage_continuous(
     plot_top_pct=5,
     plot_metric="Leakage_Gap",
     max_plots=None,
+    plot_actions=("investigate",),
+    plot_min_gap=0.0,
+    align_plots_with_exports=True,
     currency_rates_path="output/currency_rates.xlsx",
     fp_config=None,
     log_progress=True,
@@ -423,8 +426,14 @@ def analyze_intraday_leakage_continuous(
     output_folder: Folder for report CSV and leakage plots.
     plot_top_pct: Percent (0-100) of flagged leakage groups to plot.
     plot_metric: Ranking metric for plot selection. One of
-        `Leakage_Gap`, `Max_Intraday_Position`, `Max_to_EOD_Ratio`.
+        `Leakage_Gap`, `Max_Intraday_Position`, `Max_to_EOD_Ratio`,
+        `Risk_Priority_Score`.
     max_plots: Optional hard cap on the number of plots to generate.
+    plot_actions: Leakage triage actions eligible for plotting.
+    plot_min_gap: Minimum Leakage_Gap required to be plot-eligible.
+    align_plots_with_exports: If True, `Leakage_Flagged_Trades.csv`
+        contains only plotted-group trades; if False, exports all
+        non-suppressed leakage groups.
     fp_config: Optional dictionary for statistical triage config. Supported
         keys include `contamination`, `p_suppress`, `p_review`,
         `model_random_state`, and `min_training_samples`.
@@ -449,7 +458,12 @@ def analyze_intraday_leakage_continuous(
         raise ValueError("plot_top_pct must be between 0 and 100.")
     if max_plots is not None and max_plots < 0:
         raise ValueError("max_plots must be >= 0 when provided.")
+    if plot_min_gap < 0:
+        raise ValueError("plot_min_gap must be >= 0.")
     config = _build_fp_config(fp_config)
+    plot_actions = tuple(str(action) for action in plot_actions)
+    if not plot_actions:
+        raise ValueError("plot_actions must contain at least one action.")
 
     # 1) Parse execution timestamp and group by parsed-hour bucket.
     _log_progress(2, total_steps, "Parsing execution timestamps and deriving hour buckets")
@@ -632,23 +646,53 @@ def analyze_intraday_leakage_continuous(
 
     # 7) Plot only the highest-ranked flagged leakage groups.
     _log_progress(8, total_steps, "Selecting and generating leakage plots")
-    metric_candidates = {"Leakage_Gap", "Max_Intraday_Position", "Max_to_EOD_Ratio"}
+    metric_candidates = {
+        "Leakage_Gap",
+        "Max_Intraday_Position",
+        "Max_to_EOD_Ratio",
+        "Risk_Priority_Score",
+    }
     if plot_metric not in metric_candidates:
         raise ValueError(
             f"Invalid plot_metric '{plot_metric}'. Use one of: {sorted(metric_candidates)}"
         )
 
+    if not results_df.empty:
+        eps = float(config["epsilon"])
+        gap_norm = _minmax_scale(results_df["Leakage_Gap"].astype(float).to_numpy())
+        ratio_norm = _minmax_scale(results_df["Max_to_EOD_Ratio"].astype(float).to_numpy())
+        incr_norm = _minmax_scale(
+            results_df["Incremental_Intraday_Risk"].astype(float).to_numpy()
+        )
+        fp_penalty = np.nan_to_num(results_df["fp_score"].astype(float).to_numpy(), nan=0.5)
+        results_df["Risk_Priority_Score"] = (
+            0.45 * gap_norm + 0.30 * ratio_norm + 0.25 * incr_norm
+        ) / (1.0 + eps)
+        results_df["Risk_Priority_Score"] = (
+            results_df["Risk_Priority_Score"] - 0.20 * fp_penalty
+        ).clip(lower=0.0)
+    else:
+        results_df["Risk_Priority_Score"] = []
+
     leakage_df = results_df[
-        (results_df["Leakage_Detected"]) & (results_df["Action"] == "investigate")
+        (results_df["Leakage_Detected"])
+        & (results_df["Action"].isin(plot_actions))
+        & (results_df["Leakage_Gap"] >= float(plot_min_gap))
     ].copy()
     plotted_count = 0
+    selected_keys = set()
+    plot_manifest_records = []
 
-    if not leakage_df.empty and plot_top_pct > 0:
-        leakage_df = leakage_df.sort_values(plot_metric, ascending=False)
-        top_n = max(1, int(np.ceil(len(leakage_df) * (plot_top_pct / 100.0))))
+    plot_selection_df = leakage_df.sort_values(plot_metric, ascending=False).copy()
+    plot_selection_df["Plot_Rank"] = np.arange(1, len(plot_selection_df) + 1)
+    plot_selection_df["Selected_For_Plot"] = False
+
+    if not plot_selection_df.empty and plot_top_pct > 0:
+        top_n = max(1, int(np.ceil(len(plot_selection_df) * (plot_top_pct / 100.0))))
         if max_plots is not None:
             top_n = min(top_n, int(max_plots))
-        to_plot_df = leakage_df.head(top_n)
+        to_plot_df = plot_selection_df.head(top_n).copy()
+        plot_selection_df.loc[to_plot_df.index, "Selected_For_Plot"] = True
 
         for _, row in to_plot_df.iterrows():
             group_ids = (
@@ -705,14 +749,29 @@ def analyze_intraday_leakage_continuous(
                     ":", ""
                 ).replace("/", "-")
             )
-            plt.savefig(os.path.join(output_folder, f"Leakage_{safe_name}.png"))
+            png_name = f"Leakage_{safe_name}.png"
+            plt.savefig(os.path.join(output_folder, png_name))
             plt.close()
             plotted_count += 1
+            selected_keys.add(group_ids)
+            plot_manifest_records.append(
+                {
+                    "ExecDate": row["ExecDate"],
+                    "Portfolio": row["Portfolio"],
+                    "Underlying": row["Underlying"],
+                    "Maturity": row["Maturity"],
+                    "Action": row["Action"],
+                    "plot_metric": plot_metric,
+                    "plot_metric_value": float(row[plot_metric]),
+                    "plot_rank": int(row["Plot_Rank"]),
+                    "png_filename": png_name,
+                }
+            )
 
     _log_progress(8, total_steps, f"Plots generated: {plotted_count}")
 
     # 8) Map flagged leakage cases back to the original trade-level DataFrame.
-    _log_progress(9, total_steps, "Mapping escalated leakage groups back to original trades")
+    _log_progress(9, total_steps, "Mapping selected leakage groups back to original trades")
     leakage_summary = results_df[results_df["Leakage_Detected"]].copy()
     escalated_summary = leakage_summary[leakage_summary["Action"] != "suppress"].copy()
     suppressed_candidates = leakage_summary[leakage_summary["Action"] == "suppress"].copy()
@@ -726,6 +785,9 @@ def analyze_intraday_leakage_continuous(
             escalated_summary["Maturity"],
         )
     )
+    export_keys = selected_keys if align_plots_with_exports else leakage_keys
+    if not export_keys and not align_plots_with_exports:
+        export_keys = leakage_keys
 
     # Enrich the working df with execDate (already has execTime_parsed & signed_qty).
     df["execDate"] = df["execTime_parsed"].apply(
@@ -740,7 +802,7 @@ def analyze_intraday_leakage_continuous(
             row["underlyingId"],
             row["maturity"],
         )
-        in leakage_keys,
+        in export_keys,
         axis=1,
     )
     flagged_trades_df = df[flagged_mask].copy()
@@ -783,6 +845,36 @@ def analyze_intraday_leakage_continuous(
     flagged_trades_csv = os.path.join(output_folder, "Leakage_Flagged_Trades.csv")
     flagged_trades_df.to_csv(flagged_trades_csv, index=False)
 
+    plot_selection_csv = os.path.join(output_folder, "Plot_Selection_Manifest.csv")
+    manifest_df = plot_selection_df[
+        [
+            "ExecDate",
+            "Portfolio",
+            "Underlying",
+            "Maturity",
+            "Action",
+            "Leakage_Gap",
+            "Max_to_EOD_Ratio",
+            "Incremental_Intraday_Risk",
+            "fp_score",
+            "Risk_Priority_Score",
+            "Plot_Rank",
+            "Selected_For_Plot",
+        ]
+    ].copy()
+    if plot_manifest_records:
+        png_map = pd.DataFrame(plot_manifest_records)[
+            ["ExecDate", "Portfolio", "Underlying", "Maturity", "png_filename", "plot_rank"]
+        ].rename(columns={"plot_rank": "Plot_Rank"})
+        manifest_df = manifest_df.merge(
+            png_map,
+            on=["ExecDate", "Portfolio", "Underlying", "Maturity", "Plot_Rank"],
+            how="left",
+        )
+    else:
+        manifest_df["png_filename"] = ""
+    manifest_df.to_csv(plot_selection_csv, index=False)
+
     suppressed_csv = os.path.join(output_folder, "Suppressed_Leakage_Candidates.csv")
     suppressed_candidates.to_csv(suppressed_csv, index=False)
 
@@ -791,10 +883,21 @@ def analyze_intraday_leakage_continuous(
     _write_audit_report(results_df, flagged_trades_df, audit_report_path)
 
     print(f"Plots Generated              : {plotted_count}")
+    print(f"Plot Candidates              : {len(plot_selection_df)}")
+    print(f"Plot Groups Selected         : {len(selected_keys)}")
+    print(f"Plot Selection Manifest CSV  : {plot_selection_csv}")
+    print(f"Export Scope                 : {'plotted-groups' if align_plots_with_exports else 'all-escalated'}")
     print(f"Full Report                  : {csv_path}")
     print(f"Flagged Trades CSV           : {flagged_trades_csv}")
     print(f"Suppressed Candidates CSV    : {suppressed_csv}")
     print(f"Audit Report TXT             : {audit_report_path}")
+
+    if plotted_count != len(selected_keys):
+        LOGGER.warning(
+            "Reconciliation mismatch: selected_groups=%s, plotted_count=%s",
+            len(selected_keys),
+            plotted_count,
+        )
     _log_progress(9, total_steps, "Analysis complete")
 
     return results_df, flagged_trades_df

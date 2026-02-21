@@ -2,200 +2,238 @@
 
 ## Purpose
 
-The script in `riskleakage.py` detects cases where intraday risk peaked materially above end-of-day (EOD) exposure and then triages those cases into:
+The script in `riskleakage.py` detects intraday risk leakage events, triages them statistically, and now **aligns plots and exports through one explicit selection pipeline**.
+
+Primary triage outcomes:
 
 - `suppress` (likely false positive),
 - `operational-review` (ambiguous),
-- `investigate` (more anomalous).
+- `investigate` (higher risk).
 
-It also exports:
+Key governance additions in the current logic:
 
-- group-level leakage report,
-- trade-level flagged rows,
-- suppressed candidates,
-- audit-ready text report,
-- optional plots for top-ranked investigate cases.
+- configurable plot eligibility by action (`plot_actions`),
+- optional minimum leakage threshold for plotting (`plot_min_gap`),
+- risk-priority ranking metric (`Risk_Priority_Score`),
+- plot selection manifest (`Plot_Selection_Manifest.csv`),
+- optional strict alignment of plotted groups and trade export (`align_plots_with_exports`).
 
 ---
 
 ## End-to-End Pipeline
 
-`analyze_intraday_leakage_continuous()` runs in nine logical stages:
+`analyze_intraday_leakage_continuous()` runs in nine logged steps:
 
 1. **Input validation + setup**
    - Creates output folder.
-   - Validates plotting parameters.
+   - Validates `plot_top_pct`, `max_plots`, `plot_min_gap`, and `plot_actions`.
    - Builds FP scoring configuration.
 
 2. **Timestamp normalization**
    - Parses `execTime` into UTC.
-   - Converts each trade to the local market timezone inferred from `underlyingCurrency`.
-   - Buckets execution times to local hourly buckets.
+   - Converts timestamps to local market timezone from `underlyingCurrency`.
+   - Buckets executions into local hourly buckets.
 
 3. **Signed flow construction**
-   - BUY → positive quantity.
-   - SELL → negative quantity.
+   - BUY → positive quantity, SELL → negative quantity.
 
 4. **Hourly aggregation**
-   - Aggregates signed quantities by:
-     - `portfolioId`, `underlyingId`, `maturity`, `hour_bucket`.
+   - Aggregates signed flow by `portfolioId`, `underlyingId`, `maturity`, `hour_bucket`.
 
-5. **Path reconstruction and leakage metrics**
-   - Rebuilds cumulative position path from hourly net flow.
-   - Computes daily group metrics (`Prior_EOD_Position`, `SOD_Position`, `EOD_Position`, `Max_Intraday_Position`, `Leakage_Gap`, `Max_to_EOD_Ratio`).
-   - Computes normalized statistical features (below).
+5. **Position path + leakage metrics**
+   - Reconstructs cumulative position path.
+   - Computes group metrics (`Prior_EOD_Position`, `SOD_Position`, `EOD_Position`, `Max_Intraday_Position`, `Leakage_Gap`, `Max_to_EOD_Ratio`).
+   - Computes normalized model features.
 
-6. **Statistical triage scoring**
-   - Runs Isolation Forest on leakage groups using normalized features.
-   - Converts model decision function into `fp_score ∈ [0,1]` with min-max scaling.
-   - Maps score to action by cutoffs.
+6. **Statistical scoring + triage**
+   - Scores leakage groups with Isolation Forest.
+   - Produces `fp_score ∈ [0,1]`.
+   - Maps to `Action`, `Likely_FP`, and `FP_Reasons`.
 
-7. **Plot generation (investigate only)**
-   - Selects top groups by chosen metric and percent/cap.
-   - Produces bar+line intraday leakage plots.
+7. **Plot selection + generation**
+   - Computes `Risk_Priority_Score`.
+   - Filters candidates by (`Leakage_Detected`, `Action ∈ plot_actions`, `Leakage_Gap >= plot_min_gap`).
+   - Ranks by selected `plot_metric`.
+   - Marks `Selected_For_Plot` and generates PNGs.
 
-8. **Trade-level mapping**
-   - Maps escalated groups (`operational-review` + `investigate`) back to original trades.
-   - Enriches rows with group leakage metrics and triage output.
+8. **Trade mapping with alignment policy**
+   - Builds `selected_keys` from plotted groups.
+   - If `align_plots_with_exports=True`, flagged trades are limited to plotted groups.
+   - If `False`, flagged trades include all non-suppressed groups.
 
-9. **Exports and audit report**
-   - Writes CSVs and formatted TXT audit report.
+9. **Exports + reconciliation**
+   - Writes full report, flagged trades, suppressed candidates, plot-selection manifest, and audit report.
+   - Prints candidate/selected/plotted counts and export scope.
+   - Warns if selected groups and generated plots diverge.
 
 ---
 
 ## Leakage Detection Rule (Before Triage)
 
-A group is marked as `Leakage_Detected=True` when:
+A group is `Leakage_Detected=True` when all are true:
 
 1. EOD exposure is non-zero,
-2. intraday peak exposure is above EOD exposure,
-3. peak is not exactly the opening (SOD) exposure.
+2. intraday peak exposure exceeds EOD exposure,
+3. peak is not equal to opening (SOD) exposure.
 
-This stage identifies candidate leakage events. Statistical triage happens after this.
+This identifies candidate events before FP triage.
 
 ---
 
-## Normalized Features (Scale-Free)
+## Scale-Free Features Used for FP Scoring
 
-For each daily position group, the script computes:
+For each daily group:
 
 1. **`eod_retention`**
    - \( |EOD| / |Max\_Intraday| \)
-   - Fraction of peak risk still held at close.
 
 2. **`excess_excursion`**
    - \( (Max - |SOD|) / ((|SOD| + |EOD|)/2) \)
-   - Intraday risk build-up relative to book size.
 
 3. **`flow_asymmetry`**
    - \( Peak\_Hour\_Index / Total\_Hours \)
-   - Where in the day the peak occurs (early vs late).
 
 4. **`intraday_volatility`**
-   - \( std(hourly\_net\_flow) / mean(|hourly\_cumpos|) \)
-   - Noise/churn relative to typical absolute position level.
-
-These ratios avoid hard notional thresholds and generalize better across books/instruments.
+   - \( std(hourly\_flow) / mean(|cumulative\_position|) \)
 
 ---
 
-## Isolation Forest Scoring
+## Isolation Forest Scoring and Triage
 
-### Features
-
-- `eod_retention`
-- `excess_excursion`
-- `flow_asymmetry`
-- `intraday_volatility`
-
-### Behavior
+### Model behavior
 
 - Model: `IsolationForest`.
-- Input rows: leakage-detected groups.
-- Output: decision function (higher = more normal), then min-max scaled to `fp_score` in `[0,1]`.
+- Input: leakage-detected groups only.
+- Raw model output is min-max scaled to `fp_score` in `[0,1]`.
 
-### Fallbacks
+### Fallback behavior
 
-If there are too few samples or features are degenerate:
+If training data is too small or degenerate, leakage cases get neutral score `0.5`.
 
-- score defaults to `0.5` (neutral),
-- triage naturally falls into `operational-review` unless cutoffs are altered.
-
----
-
-## Triage Policy
-
-Configured by two cutoffs:
-
-- `p_suppress` (default `0.75`)
-- `p_review` (default `0.40`)
-
-Action mapping:
+### Action mapping
 
 - `fp_score >= p_suppress` → `suppress`
 - `p_review <= fp_score < p_suppress` → `operational-review`
 - `fp_score < p_review` → `investigate`
 
-Reason tags:
+Reason codes:
 
-- `high_fp_score`
-- `mid_fp_score`
-- `low_fp_score`
-- `score_unavailable` (defensive fallback)
+- `high_fp_score`, `mid_fp_score`, `low_fp_score`, `score_unavailable`.
 
 ---
 
-## Progress Logging
+## Risk-Priority Ranking for Plotting
 
-The function supports `log_progress=True` (default).
+The function computes:
 
-It logs each major stage with an index like `[step/9]`, including:
+- `Risk_Priority_Score = 0.45*norm(Leakage_Gap) + 0.30*norm(Max_to_EOD_Ratio) + 0.25*norm(Incremental_Intraday_Risk) - 0.20*fp_score`
 
-- input row count,
+Implementation notes:
+
+- each risk input is min-max normalized over current results,
+- `fp_score` is used as a penalty,
+- final score is clipped at zero,
+- this metric can be selected via `plot_metric="Risk_Priority_Score"`.
+
+---
+
+## Plot Candidate and Selection Logic
+
+Candidate groups are filtered by:
+
+- `Leakage_Detected == True`,
+- `Action` in `plot_actions` (default: `("investigate",)`),
+- `Leakage_Gap >= plot_min_gap` (default `0.0`).
+
+Selection and plotting:
+
+- candidates are sorted by `plot_metric`,
+- `Plot_Rank` is assigned,
+- top `ceil(N * plot_top_pct/100)` groups are selected,
+- optional `max_plots` cap is applied,
+- selected rows are marked `Selected_For_Plot=True`,
+- one PNG per selected group is generated.
+
+---
+
+## Plot/CSV Alignment Policy
+
+`align_plots_with_exports` controls trade-level export scope:
+
+- `True` (default): `Leakage_Flagged_Trades.csv` contains **only plotted groups**,
+- `False`: `Leakage_Flagged_Trades.csv` contains **all escalated groups** (`Action != suppress`).
+
+This prevents silent drift between what is plotted and what is exported.
+
+---
+
+## Outputs
+
+Generated in output folder:
+
+- `Full_Leakage_Report_Continuous.csv` (all group metrics + triage),
+- `Leakage_Flagged_Trades.csv` (trade-level rows based on alignment policy),
+- `Suppressed_Leakage_Candidates.csv`,
+- `Plot_Selection_Manifest.csv` (candidate/selection transparency),
+- `Audit_Report.txt`,
+- `Leakage_*.png` (for selected groups).
+
+### `Plot_Selection_Manifest.csv` fields
+
+Includes, at minimum:
+
+- group keys (`ExecDate`, `Portfolio`, `Underlying`, `Maturity`),
+- `Action`, leakage metrics, `fp_score`, `Risk_Priority_Score`,
+- `Plot_Rank`, `Selected_For_Plot`,
+- `png_filename` for selected rows.
+
+---
+
+## Main Parameters
+
+### Function plotting/alignment parameters
+
+- `plot_top_pct` (0–100),
+- `plot_metric` in `{Leakage_Gap, Max_Intraday_Position, Max_to_EOD_Ratio, Risk_Priority_Score}`,
+- `max_plots` (optional cap),
+- `plot_actions` (tuple of eligible actions),
+- `plot_min_gap` (minimum `Leakage_Gap`),
+- `align_plots_with_exports` (bool).
+
+### `fp_config` parameters
+
+- `contamination` (default `0.10`),
+- `p_suppress` (default `0.75`),
+- `p_review` (default `0.40`),
+- `model_random_state` (default `42`),
+- `min_training_samples` (default `8`),
+- `epsilon` (default `1e-9`).
+
+Validation:
+
+- `0 <= p_review < p_suppress <= 1`,
+- `0 < contamination <= 0.5`,
+- `plot_min_gap >= 0`,
+- non-empty `plot_actions`.
+
+---
+
+## Progress and Reconciliation Logging
+
+With `log_progress=True`, logs include:
+
+- input size,
 - hourly bucket count,
 - daily group count,
 - leakage case count,
 - generated plot count,
-- flagged trade export count,
-- completion notification.
+- flagged trade count,
+- completion signal.
 
-This makes long runs auditable and easier to monitor in terminal output.
+Final console summary also prints:
 
----
-
-## Key Outputs
-
-In the selected output folder:
-
-- `Full_Leakage_Report_Continuous.csv`
-- `Leakage_Flagged_Trades.csv`
-- `Suppressed_Leakage_Candidates.csv`
-- `Audit_Report.txt`
-- `Leakage_*.png` (when plotting enabled)
-
----
-
-## Main Config Knobs (`fp_config`)
-
-- `contamination` (default `0.10`)
-- `p_suppress` (default `0.75`)
-- `p_review` (default `0.40`)
-- `model_random_state` (default `42`)
-- `min_training_samples` (default `8`)
-- `epsilon` (default `1e-9`)
-
-Validation rules:
-
-- `0 <= p_review < p_suppress <= 1`
-- `0 < contamination <= 0.5`
-
----
-
-## Practical Governance Workflow
-
-1. Run monthly on rolling history.
-2. Track outcomes for reviewed/investigated cases.
-3. Revisit `contamination`, `p_review`, `p_suppress` quarterly.
-4. Keep model random state fixed for reproducibility unless intentionally changed.
-
-This keeps triage simple, data-driven, and auditable.
+- plot candidate count,
+- selected plot-group count,
+- manifest path,
+- export scope mode,
+- reconciliation warning if selected groups != plotted files.
