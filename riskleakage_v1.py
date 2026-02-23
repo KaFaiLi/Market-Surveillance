@@ -268,7 +268,7 @@ def analyze_intraday_leakage_continuous(
         axis=1,
     )
     df["hour_bucket"] = df["execTime_parsed"].apply(
-        lambda ts: ts.replace(minute=0, second=0, microsecond=0)
+        lambda ts: ts.replace(minute=0, second=0, microsecond=0, tzinfo=None)
         if ts is not None
         else None
     )
@@ -419,10 +419,10 @@ def analyze_intraday_leakage_continuous(
 
             fig, ax = plt.subplots(figsize=(11, 6))
 
-            bucket_tz = getattr(group_df["hour_bucket"].iloc[0], "tzinfo", None)
             hour_bin_centers = group_df["hour_bucket"]
             sod_time_center = sod_time
             eod_time_center = eod_time
+            local_tz_name = _currency_to_timezone(row["Currency"]) or "UTC"
 
             ax.bar(
                 hour_bin_centers,
@@ -455,9 +455,10 @@ def analyze_intraday_leakage_continuous(
             x_start = group_df["hour_bucket"].iloc[0]
             x_end = group_df["hour_bucket"].iloc[-1] + timedelta(hours=1)
             ax.set_xlim(x_start, x_end)
-            ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=bucket_tz))
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=bucket_tz))
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
             ax.axhline(0, color="black", linewidth=0.5)
+            ax.set_xlabel(f"Hour ({local_tz_name})")
             ax.set_ylabel("Position")
             ax.tick_params(axis="x", labelrotation=45)
             ax.legend()
