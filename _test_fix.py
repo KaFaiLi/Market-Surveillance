@@ -1,8 +1,8 @@
 """Quick test to verify underlyingCurrency grouping fix."""
 import sys
 import pandas as pd
-from riskleakage_v1 import analyze_intraday_leakage_continuous
-from riskleakage_v1 import _currency_to_timezone, _parse_exec_time_to_utc, _to_local_exec_time
+from riskleakage_position import analyze_intraday_leakage_continuous
+from riskleakage_position import _currency_to_timezone, _parse_exec_time_to_utc, _to_local_exec_time
 
 out = open("_test_fix_output.txt", "w")
 sys.stdout = out

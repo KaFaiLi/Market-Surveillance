@@ -548,5 +548,5 @@ def analyze_intraday_leakage_continuous(
 if __name__ == "__main__":
     df_trades = pd.read_csv("output/synthetic_trading_data.csv")
     results, flagged = analyze_intraday_leakage_continuous(
-        df_trades, plot_top_pct=5, plot_metric="Max_to_EOD_Ratio", max_plots=20
+        df_trades, plot_top_pct=5, plot_metric="Max_to_Baseline_EOD_Ratio", max_plots=20
     )
