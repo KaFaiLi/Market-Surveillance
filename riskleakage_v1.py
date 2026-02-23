@@ -256,6 +256,27 @@ def analyze_intraday_leakage_continuous(
     df["market_timezone"] = df.get(
         "underlyingCurrency", pd.Series(index=df.index)
     ).apply(_currency_to_timezone)
+    tz_counts = df.groupby(position_keys)["market_timezone"].nunique(dropna=False)
+    mixed_tz = tz_counts[tz_counts > 1]
+    if not mixed_tz.empty:
+        sample = mixed_tz.head(10)
+        print(
+            "Warning: mixed market timezones detected for some position groups. "
+            "Using the first non-null timezone per group."
+        )
+        print(sample.to_string())
+        for keys in sample.index:
+            subset = df.loc[
+                (df["portfolioId"] == keys[0])
+                & (df["underlyingId"] == keys[1])
+                & (df["maturity"] == keys[2]),
+                ["underlyingCurrency", "market_timezone"],
+            ].drop_duplicates()
+            print(
+                "Mixed group currencies/timezones for "
+                f"{keys[0]} | {keys[1]} | {keys[2]}:"
+            )
+            print(subset.to_string(index=False))
     df["group_market_timezone"] = df.groupby(position_keys)["market_timezone"].transform(
         _first_non_null_timezone
     )
