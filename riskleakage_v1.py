@@ -430,15 +430,15 @@ def analyze_intraday_leakage_continuous(
             fig, ax = plt.subplots(figsize=(11, 6))
 
             bucket_tz = getattr(group_df["hour_bucket"].iloc[0], "tzinfo", None)
-            hour_bin_centers = group_df["hour_bucket"] + timedelta(minutes=30)
-            sod_time_center = sod_time + timedelta(minutes=30)
-            eod_time_center = eod_time + timedelta(minutes=30)
+            hour_bin_centers = group_df["hour_bucket"]
+            sod_time_center = sod_time
+            eod_time_center = eod_time
 
             ax.bar(
                 hour_bin_centers,
                 group_df["cumulative_pos"],
-                width=timedelta(minutes=45),
-                align="center",
+                width=timedelta(hours=1),
+                align="edge",
                 alpha=0.85,
                 edgecolor="#1f1f1f",
                 linewidth=0.6,
@@ -462,8 +462,8 @@ def analyze_intraday_leakage_continuous(
                 fontsize=11,
             )
 
-            x_start = group_df["hour_bucket"].iloc[0] - timedelta(minutes=30)
-            x_end = group_df["hour_bucket"].iloc[-1] + timedelta(hours=1, minutes=30)
+            x_start = group_df["hour_bucket"].iloc[0]
+            x_end = group_df["hour_bucket"].iloc[-1] + timedelta(hours=1)
             ax.set_xlim(x_start, x_end)
             ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=bucket_tz))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=bucket_tz))
