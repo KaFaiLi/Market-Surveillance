@@ -223,6 +223,8 @@ def analyze_intraday_leakage_continuous(
     plot_top_pct=5,
     plot_metric="Leakage_Gap",
     max_plots=None,
+    debug_sorting=False,
+    expected_start_hour=9,
 ):
     """Analyze intraday position leakage from execution-level trades.
 
@@ -323,6 +325,16 @@ def analyze_intraday_leakage_continuous(
     for group_ids, group_df in hourly_net.groupby(daily_keys):
         exec_date, port, und, mat = group_ids
         group_df = group_df.sort_values("hour_bucket", kind="mergesort")
+        if debug_sorting:
+            first_bucket = group_df["hour_bucket"].iloc[0]
+            if expected_start_hour is not None and first_bucket is not None:
+                if first_bucket.hour != expected_start_hour:
+                    print(
+                        "Warning: first hour_bucket is not the expected start hour for "
+                        f"{exec_date} | {port} | {und} | {mat}. "
+                        f"First bucket: {first_bucket}"
+                    )
+                    print(group_df["hour_bucket"].head(10).to_string(index=False))
         group_frames[group_ids] = group_df.copy()
         bin_count = len(group_df)
 
