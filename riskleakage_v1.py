@@ -325,7 +325,7 @@ def analyze_intraday_leakage_continuous(
         sod_exposure = abs(sod_pos)
         prior_eod_exposure = abs(prior_eod_pos)
         eod_exposure = abs(eod_pos)
-        baseline_eod_exposure = max(prior_eod_exposure, eod_exposure)
+        baseline_eod_exposure = max(sod_exposure, eod_exposure)
         leakage_gap = max_exposure - eod_exposure
         max_to_eod_ratio = max_exposure / (eod_exposure + 1e-9)
         max_to_prior_eod_ratio = max_exposure / (prior_eod_exposure + 1e-9)
@@ -333,7 +333,7 @@ def analyze_intraday_leakage_continuous(
 
         # Ignore mixed-zero edge cases (only one of SOD/EOD is zero),
         # but keep groups where both are zero.
-        mixed_zero_sod_eod = (sod_exposure == 0) ^ (eod_exposure == 0)
+        mixed_zero_sod_eod = (prior_eod_exposure == 0) ^ (eod_exposure == 0)
 
         # Exclude groups with <=2 hourly bins (SOD/EOD only, no intraday path).
         enough_intraday_bins = bin_count > 2
@@ -419,13 +419,14 @@ def analyze_intraday_leakage_continuous(
 
             fig, ax = plt.subplots(figsize=(11, 6))
 
-            hour_bin_centers = group_df["hour_bucket"]
-            sod_time_center = sod_time
-            eod_time_center = eod_time
+            hour_bin_starts = group_df["hour_bucket"]
+            hour_bin_centers = hour_bin_starts + timedelta(minutes=30)
+            sod_time_center = sod_time + timedelta(minutes=30)
+            eod_time_center = eod_time + timedelta(minutes=30)
             local_tz_name = _currency_to_timezone(row["Currency"]) or "UTC"
 
             ax.bar(
-                hour_bin_centers,
+                hour_bin_starts,
                 group_df["cumulative_pos"],
                 width=timedelta(hours=1),
                 align="edge",
