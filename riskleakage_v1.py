@@ -290,6 +290,7 @@ def analyze_intraday_leakage_continuous(
         exec_date, port, und, mat = group_ids
         group_df = group_df.sort_values("hour_bucket")
         group_frames[group_ids] = group_df.copy()
+        bin_count = len(group_df)
 
         sod_pos = group_df["cumulative_pos"].iloc[0]
         eod_pos = group_df["cumulative_pos"].iloc[-1]
@@ -310,8 +311,13 @@ def analyze_intraday_leakage_continuous(
         # but keep groups where both are zero.
         mixed_zero_sod_eod = (sod_exposure == 0) ^ (eod_exposure == 0)
 
+        # Exclude groups with <=2 hourly bins (SOD/EOD only, no intraday path).
+        enough_intraday_bins = bin_count > 2
+
         # Flag leakage only when peak intraday exposure exceeds both prior and current EOD.
         is_leakage = (
+            enough_intraday_bins
+            and
             (not mixed_zero_sod_eod)
             and
             (max_exposure > eod_exposure)
@@ -324,6 +330,7 @@ def analyze_intraday_leakage_continuous(
                 "Portfolio": port,
                 "Underlying": und,
                 "Maturity": mat,
+                "Bin_Count": bin_count,
                 "Prior_EOD_Position": prior_eod_pos,
                 "SOD_Position": sod_pos,
                 "EOD_Position": eod_pos,
@@ -376,6 +383,8 @@ def analyze_intraday_leakage_continuous(
 
             bucket_tz = getattr(group_df["hour_bucket"].iloc[0], "tzinfo", None)
             hour_bin_centers = group_df["hour_bucket"] + timedelta(minutes=30)
+            sod_time_center = sod_time + timedelta(minutes=30)
+            eod_time_center = eod_time + timedelta(minutes=30)
 
             ax.bar(
                 hour_bin_centers,
@@ -389,7 +398,7 @@ def analyze_intraday_leakage_continuous(
             )
 
             ax.plot(
-                [sod_time, eod_time],
+                [sod_time_center, eod_time_center],
                 [sod_pos, eod_pos],
                 color="red",
                 linestyle="--",
