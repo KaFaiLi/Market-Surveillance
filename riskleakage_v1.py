@@ -149,7 +149,7 @@ def _write_audit_report(
         sorted_leakage = leakage_df.sort_values("Leakage_Gap", ascending=False).reset_index(drop=True)
         t3 = PrettyTable()
         t3.field_names = [
-            "#", "ExecDate", "Portfolio", "Underlying", "Maturity",
+            "#", "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
             "Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio",
         ]
         for col in ["Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio"]:
@@ -161,6 +161,7 @@ def _write_audit_report(
                 row["Portfolio"],
                 row["Underlying"],
                 row["Maturity"],
+                row["Currency"],
                 f"{row['Prior_EOD_Position']:>12,.0f}",
                 f"{row['SOD_Position']:>12,.0f}",
                 f"{row['EOD_Position']:>12,.0f}",
@@ -181,7 +182,7 @@ def _write_audit_report(
             w(sep)
 
             grp_summary = (
-                flagged_trades_df.groupby(["ExecDate", "Portfolio", "Underlying", "Maturity"])
+                flagged_trades_df.groupby(["ExecDate", "Portfolio", "Underlying", "Maturity", "Currency"])
                 .agg(
                     Trade_Count=("signed_qty", "count"),
                     Gross_Buy_Qty=("signed_qty", lambda x: x[x > 0].sum()),
@@ -194,7 +195,7 @@ def _write_audit_report(
 
             t4 = PrettyTable()
             t4.field_names = [
-                "ExecDate", "Portfolio", "Underlying", "Maturity",
+                "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
                 "Trades", "Gross Buy", "Gross Sell", "Net Qty",
             ]
             for col in ["Trades", "Gross Buy", "Gross Sell", "Net Qty"]:
@@ -205,6 +206,7 @@ def _write_audit_report(
                     row["Portfolio"],
                     row["Underlying"],
                     row["Maturity"],
+                    row["Currency"],
                     f"{int(row['Trade_Count']):,}",
                     f"{row['Gross_Buy_Qty']:>14,.0f}",
                     f"{row['Gross_Sell_Qty']:>14,.0f}",
@@ -252,40 +254,16 @@ def analyze_intraday_leakage_continuous(
     if max_plots is not None and max_plots < 0:
         raise ValueError("max_plots must be >= 0 when provided.")
 
-    position_keys = ["portfolioId", "underlyingId", "maturity"]
+    position_keys = ["portfolioId", "underlyingId", "maturity", "underlyingCurrency"]
 
     # 1) Parse execution timestamp and group by parsed-hour bucket.
     df["market_timezone"] = df.get(
         "underlyingCurrency", pd.Series(index=df.index)
     ).apply(_currency_to_timezone)
-    tz_counts = df.groupby(position_keys)["market_timezone"].nunique(dropna=False)
-    mixed_tz = tz_counts[tz_counts > 1]
-    if not mixed_tz.empty:
-        sample = mixed_tz.head(10)
-        print(
-            "Warning: mixed market timezones detected for some position groups. "
-            "Using the first non-null timezone per group."
-        )
-        print(sample.to_string())
-        for keys in sample.index:
-            subset = df.loc[
-                (df["portfolioId"] == keys[0])
-                & (df["underlyingId"] == keys[1])
-                & (df["maturity"] == keys[2]),
-                ["underlyingCurrency", "market_timezone"],
-            ].drop_duplicates()
-            print(
-                "Mixed group currencies/timezones for "
-                f"{keys[0]} | {keys[1]} | {keys[2]}:"
-            )
-            print(subset.to_string(index=False))
-    df["group_market_timezone"] = df.groupby(position_keys)["market_timezone"].transform(
-        _first_non_null_timezone
-    )
     df["execTime_parsed_utc"] = df["execTime"].apply(_parse_exec_time_to_utc)
     df["execTime_parsed"] = df.apply(
         lambda row: _to_local_exec_time(
-            row["execTime_parsed_utc"], row["group_market_timezone"]
+            row["execTime_parsed_utc"], row["market_timezone"]
         ),
         axis=1,
     )
@@ -320,10 +298,10 @@ def analyze_intraday_leakage_continuous(
     # 5) Evaluate leakage per exec-date and position key.
     summary_data = []
     group_frames = {}
-    daily_keys = ["execDate", "portfolioId", "underlyingId", "maturity"]
+    daily_keys = ["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"]
 
     for group_ids, group_df in hourly_net.groupby(daily_keys):
-        exec_date, port, und, mat = group_ids
+        exec_date, port, und, mat, ccy = group_ids
         group_df = group_df.sort_values("hour_bucket", kind="mergesort")
         if debug_sorting:
             first_bucket = group_df["hour_bucket"].iloc[0]
@@ -331,7 +309,7 @@ def analyze_intraday_leakage_continuous(
                 if first_bucket.hour != expected_start_hour:
                     print(
                         "Warning: first hour_bucket is not the expected start hour for "
-                        f"{exec_date} | {port} | {und} | {mat}. "
+                        f"{exec_date} | {port} | {und} | {mat} | {ccy}. "
                         f"First bucket: {first_bucket}"
                     )
                     print(group_df["hour_bucket"].head(10).to_string(index=False))
@@ -376,6 +354,7 @@ def analyze_intraday_leakage_continuous(
                 "Portfolio": port,
                 "Underlying": und,
                 "Maturity": mat,
+                "Currency": ccy,
                 "Bin_Count": bin_count,
                 "Prior_EOD_Position": prior_eod_pos,
                 "SOD_Position": sod_pos,
@@ -414,12 +393,23 @@ def analyze_intraday_leakage_continuous(
                 row["Portfolio"],
                 row["Underlying"],
                 row["Maturity"],
+                row["Currency"],
             )
             group_df = group_frames.get(group_ids)
             if group_df is None or group_df.empty:
                 continue
 
             group_df = group_df.sort_values("hour_bucket", kind="mergesort").reset_index(drop=True)
+
+            if debug_sorting:
+                print(
+                    f"\n[PLOT DEBUG] Group: {row['ExecDate']} | {row['Portfolio']} | "
+                    f"{row['Underlying']} | {row['Maturity']} | {row['Currency']}"
+                )
+                print(f"  Buckets ({len(group_df)} total, earliest 5):")
+                print(group_df["hour_bucket"].head(5).to_string(index=False))
+                print(f"  First bucket : {group_df['hour_bucket'].iloc[0]}")
+                print(f"  Last  bucket : {group_df['hour_bucket'].iloc[-1]}")
 
             sod_time = group_df["hour_bucket"].iloc[0]
             eod_time = group_df["hour_bucket"].iloc[-1]
@@ -457,7 +447,7 @@ def analyze_intraday_leakage_continuous(
 
             ax.set_title(
                 f"Intraday Risk Leakage\n"
-                f"{row['Underlying']} | {row['Portfolio']} | {row['ExecDate']}\n"
+                f"{row['Underlying']} ({row['Currency']}) | {row['Portfolio']} | {row['ExecDate']}\n"
                 f"Peak: {max_exposure:,.0f} | EOD: {eod_pos:,.0f} | {plot_metric}: {row[plot_metric]:,.2f}",
                 fontsize=11,
             )
@@ -474,7 +464,7 @@ def analyze_intraday_leakage_continuous(
             ax.grid(axis="y", linestyle=":", alpha=0.5)
 
             safe_name = (
-                f"{row['ExecDate']}_{row['Portfolio']}_{row['Underlying']}".replace(
+                f"{row['ExecDate']}_{row['Portfolio']}_{row['Underlying']}_{row['Currency']}".replace(
                     ":", ""
                 ).replace("/", "-")
             )
@@ -485,33 +475,24 @@ def analyze_intraday_leakage_continuous(
     # 7) Map flagged leakage cases back to the original trade-level DataFrame.
     leakage_summary = results_df[results_df["Leakage_Detected"]].copy()
 
-    # Build a lookup set of (execDate, portfolioId, underlyingId, maturity).
-    leakage_keys = set(
-        zip(
-            leakage_summary["ExecDate"],
-            leakage_summary["Portfolio"],
-            leakage_summary["Underlying"],
-            leakage_summary["Maturity"],
-        )
-    )
-
     # Enrich the working df with execDate (already has execTime_parsed & signed_qty).
     df["execDate"] = df["execTime_parsed"].apply(
         lambda ts: ts.date() if ts is not None else None
     )
 
-    # Filter original trades that belong to a flagged group.
-    flagged_mask = df.apply(
-        lambda row: (
-            row["execDate"],
-            row["portfolioId"],
-            row["underlyingId"],
-            row["maturity"],
-        )
-        in leakage_keys,
-        axis=1,
-    )
-    flagged_trades_df = df[flagged_mask].copy()
+    # Filter original trades that belong to a flagged group via fast merge.
+    leakage_flag_keys = leakage_summary.rename(
+        columns={
+            "ExecDate": "execDate",
+            "Portfolio": "portfolioId",
+            "Underlying": "underlyingId",
+            "Maturity": "maturity",
+            "Currency": "underlyingCurrency",
+        }
+    )[["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"]].copy()
+    leakage_flag_keys["_flagged"] = True
+    df_flagged = df.merge(leakage_flag_keys, on=["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"], how="left")
+    flagged_trades_df = df_flagged[df_flagged["_flagged"] == True].drop(columns=["_flagged"]).copy()
 
     # Merge leakage metrics into the flagged trades for full context.
     leakage_merge = leakage_summary.rename(
@@ -520,14 +501,15 @@ def analyze_intraday_leakage_continuous(
             "Portfolio": "portfolioId",
             "Underlying": "underlyingId",
             "Maturity": "maturity",
+            "Currency": "underlyingCurrency",
         }
-    )[["execDate", "portfolioId", "underlyingId", "maturity",
+    )[["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency",
        "Prior_EOD_Position", "SOD_Position", "EOD_Position",
          "Max_Intraday_Position", "Leakage_Gap", "Max_to_EOD_Ratio", "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio"]]
 
     flagged_trades_df = flagged_trades_df.merge(
         leakage_merge,
-        on=["execDate", "portfolioId", "underlyingId", "maturity"],
+        on=["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"],
         how="left",
     )
 
@@ -538,6 +520,7 @@ def analyze_intraday_leakage_continuous(
             "portfolioId": "Portfolio",
             "underlyingId": "Underlying",
             "maturity": "Maturity",
+            "underlyingCurrency": "Currency",
         }
     )
 
