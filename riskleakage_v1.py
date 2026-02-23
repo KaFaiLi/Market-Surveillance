@@ -297,6 +297,7 @@ def analyze_intraday_leakage_continuous(
         prior_eod_pos = sod_pos - group_df["signed_qty"].iloc[0]
 
         max_exposure = group_df["cumulative_pos"].abs().max()
+        sod_exposure = abs(sod_pos)
         prior_eod_exposure = abs(prior_eod_pos)
         eod_exposure = abs(eod_pos)
         baseline_eod_exposure = max(prior_eod_exposure, eod_exposure)
@@ -305,8 +306,14 @@ def analyze_intraday_leakage_continuous(
         max_to_prior_eod_ratio = max_exposure / (prior_eod_exposure + 1e-9)
         max_to_baseline_eod_ratio = max_exposure / (baseline_eod_exposure + 1e-9)
 
+        # Ignore mixed-zero edge cases (only one of SOD/EOD is zero),
+        # but keep groups where both are zero.
+        mixed_zero_sod_eod = (sod_exposure == 0) ^ (eod_exposure == 0)
+
         # Flag leakage only when peak intraday exposure exceeds both prior and current EOD.
         is_leakage = (
+            (not mixed_zero_sod_eod)
+            and
             (max_exposure > eod_exposure)
             and (max_exposure > prior_eod_exposure)
         )
@@ -368,13 +375,16 @@ def analyze_intraday_leakage_continuous(
             fig, ax = plt.subplots(figsize=(11, 6))
 
             bucket_tz = getattr(group_df["hour_bucket"].iloc[0], "tzinfo", None)
+            hour_bin_centers = group_df["hour_bucket"] + timedelta(minutes=30)
 
             ax.bar(
-                group_df["hour_bucket"],
+                hour_bin_centers,
                 group_df["cumulative_pos"],
-                width=timedelta(hours=1),
-                align="edge",
-                alpha=0.8,
+                width=timedelta(minutes=45),
+                align="center",
+                alpha=0.85,
+                edgecolor="#1f1f1f",
+                linewidth=0.6,
                 label="Hourly Cumulative Position",
             )
 
@@ -395,9 +405,14 @@ def analyze_intraday_leakage_continuous(
                 fontsize=11,
             )
 
+            x_start = group_df["hour_bucket"].iloc[0] - timedelta(minutes=30)
+            x_end = group_df["hour_bucket"].iloc[-1] + timedelta(hours=1, minutes=30)
+            ax.set_xlim(x_start, x_end)
+            ax.xaxis.set_major_locator(mdates.HourLocator(interval=1, tz=bucket_tz))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M", tz=bucket_tz))
             ax.axhline(0, color="black", linewidth=0.5)
             ax.set_ylabel("Position")
+            ax.tick_params(axis="x", labelrotation=45)
             ax.legend()
             ax.grid(axis="y", linestyle=":", alpha=0.5)
 
