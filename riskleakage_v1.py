@@ -43,6 +43,14 @@ def _to_local_exec_time(exec_time_utc, local_timezone):
         return exec_time_utc
 
 
+def _first_non_null_timezone(values):
+    """Return first non-null timezone string from a sequence, else None."""
+    for value in values:
+        if pd.notna(value):
+            return value
+    return None
+
+
 def _write_audit_report(
     results_df: pd.DataFrame,
     flagged_trades_df: pd.DataFrame,
@@ -242,14 +250,19 @@ def analyze_intraday_leakage_continuous(
     if max_plots is not None and max_plots < 0:
         raise ValueError("max_plots must be >= 0 when provided.")
 
+    position_keys = ["portfolioId", "underlyingId", "maturity"]
+
     # 1) Parse execution timestamp and group by parsed-hour bucket.
     df["market_timezone"] = df.get(
         "underlyingCurrency", pd.Series(index=df.index)
     ).apply(_currency_to_timezone)
+    df["group_market_timezone"] = df.groupby(position_keys)["market_timezone"].transform(
+        _first_non_null_timezone
+    )
     df["execTime_parsed_utc"] = df["execTime"].apply(_parse_exec_time_to_utc)
     df["execTime_parsed"] = df.apply(
         lambda row: _to_local_exec_time(
-            row["execTime_parsed_utc"], row["market_timezone"]
+            row["execTime_parsed_utc"], row["group_market_timezone"]
         ),
         axis=1,
     )
@@ -258,6 +271,7 @@ def analyze_intraday_leakage_continuous(
         if ts is not None
         else None
     )
+    df = df.sort_values("hour_bucket", kind="mergesort").reset_index(drop=True)
 
     # 2) Signed quantity.
     df["signed_qty"] = np.where(
@@ -265,12 +279,11 @@ def analyze_intraday_leakage_continuous(
     )
 
     # 3) Aggregate signed flow by local-hour bucket per position key.
-    position_keys = ["portfolioId", "underlyingId", "maturity"]
     hourly_net = (
         df.groupby(position_keys + ["hour_bucket"])["signed_qty"]
         .sum()
         .reset_index()
-        .sort_values(by=position_keys + ["hour_bucket"])
+        .sort_values(by=position_keys + ["hour_bucket"], kind="mergesort")
     )
 
     # 4) Rebuild position path from hourly net flow.
@@ -288,7 +301,7 @@ def analyze_intraday_leakage_continuous(
 
     for group_ids, group_df in hourly_net.groupby(daily_keys):
         exec_date, port, und, mat = group_ids
-        group_df = group_df.sort_values("hour_bucket")
+        group_df = group_df.sort_values("hour_bucket", kind="mergesort")
         group_frames[group_ids] = group_df.copy()
         bin_count = len(group_df)
 
@@ -372,6 +385,8 @@ def analyze_intraday_leakage_continuous(
             group_df = group_frames.get(group_ids)
             if group_df is None or group_df.empty:
                 continue
+
+            group_df = group_df.sort_values("hour_bucket", kind="mergesort").reset_index(drop=True)
 
             sod_time = group_df["hour_bucket"].iloc[0]
             eod_time = group_df["hour_bucket"].iloc[-1]
