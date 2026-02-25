@@ -208,10 +208,10 @@ def _write_audit_report(
             grp_summary = (
                 flagged_trades_df.groupby(["ExecDate", "Portfolio", "Underlying", "Maturity", "Currency"])
                 .agg(
-                    Trade_Count=("signed_qty", "count"),
-                    Gross_Buy_Qty=("signed_qty", lambda x: x[x > 0].sum()),
-                    Gross_Sell_Qty=("signed_qty", lambda x: x[x < 0].sum()),
-                    Net_Qty=("signed_qty", "sum"),
+                    Trade_Count=("signed_contracts", "count"),
+                    Gross_Buy_Contracts=("signed_contracts", lambda x: x[x > 0].sum()),
+                    Gross_Sell_Contracts=("signed_contracts", lambda x: x[x < 0].sum()),
+                    Net_Contracts=("signed_contracts", "sum"),
                 )
                 .reset_index()
                 .sort_values("Trade_Count", ascending=False)
@@ -220,9 +220,9 @@ def _write_audit_report(
             t4 = PrettyTable()
             t4.field_names = [
                 "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
-                "Trades", "Gross Buy", "Gross Sell", "Net Qty",
+                "Trades", "Gross Buy Contracts", "Gross Sell Contracts", "Net Contracts",
             ]
-            for col in ["Trades", "Gross Buy", "Gross Sell", "Net Qty"]:
+            for col in ["Trades", "Gross Buy Contracts", "Gross Sell Contracts", "Net Contracts"]:
                 t4.align[col] = "r"
             for _, row in grp_summary.iterrows():
                 t4.add_row([
@@ -232,9 +232,9 @@ def _write_audit_report(
                     row["Maturity"],
                     row["Currency"],
                     f"{int(row['Trade_Count']):,}",
-                    f"{row['Gross_Buy_Qty']:>14,.0f}",
-                    f"{row['Gross_Sell_Qty']:>14,.0f}",
-                    f"{row['Net_Qty']:>14,.0f}",
+                    f"{row['Gross_Buy_Contracts']:>14,.0f}",
+                    f"{row['Gross_Sell_Contracts']:>14,.0f}",
+                    f"{row['Net_Contracts']:>14,.0f}",
                 ])
             w(t4)
 
@@ -329,25 +329,39 @@ def analyze_intraday_leakage_continuous(
         )
 
     df["premium_eur"] = pd.to_numeric(df["premium"], errors="coerce") * df["rate_to_eur"]
-    df["notional_eur"] = df["premium_eur"] * pd.to_numeric(df["quantity"], errors="coerce")
+    df["quantity_numeric"] = pd.to_numeric(df["quantity"], errors="coerce")
+    df["notional_eur"] = df["premium_eur"] * df["quantity_numeric"]
 
-    # Signed notional: BUY positive, SELL negative.
-    df["signed_qty"] = np.where(
-        df["way"].str.upper() == "BUY", df["notional_eur"], -df["notional_eur"]
+    # Signed contract quantity: BUY positive, SELL negative.
+    df["signed_contracts"] = np.where(
+        df["way"].str.upper() == "BUY", df["quantity_numeric"], -df["quantity_numeric"]
     )
 
-    # 3) Aggregate signed flow by local-hour bucket per position key.
+    # 3) Aggregate signed contract flow and build hourly VWAP market-price proxy.
     hourly_net = (
-        df.groupby(position_keys + ["hour_bucket"])["signed_qty"]
-        .sum()
+        df.groupby(position_keys + ["hour_bucket"])
+        .agg(
+            net_contracts=("signed_contracts", "sum"),
+            total_notional_eur=("notional_eur", "sum"),
+            total_volume=("quantity_numeric", "sum"),
+        )
         .reset_index()
         .sort_values(by=position_keys + ["hour_bucket"], kind="mergesort")
     )
+    # Volume-weighted average price (EUR per contract) per hour bucket.
+    hourly_net["vwap_eur"] = (
+        hourly_net["total_notional_eur"]
+        / hourly_net["total_volume"].replace(0, np.nan)
+    )
+    # Forward-fill VWAP within each position key for robustness.
+    hourly_net["vwap_eur"] = hourly_net.groupby(position_keys)["vwap_eur"].ffill()
 
-    # 4) Rebuild position path from hourly net flow.
-    hourly_net["cumulative_pos"] = hourly_net.groupby(position_keys)[
-        "signed_qty"
+    # 4) Rebuild contract position path and mark-to-market EUR exposure.
+    hourly_net["cumulative_contracts"] = hourly_net.groupby(position_keys)[
+        "net_contracts"
     ].cumsum()
+    # EUR exposure = cumulative contracts × hourly VWAP price.
+    hourly_net["exposure_eur"] = hourly_net["cumulative_contracts"] * hourly_net["vwap_eur"]
     hourly_net["execDate"] = hourly_net["hour_bucket"].apply(
         lambda ts: ts.date() if ts is not None else None
     )
@@ -373,12 +387,16 @@ def analyze_intraday_leakage_continuous(
         group_frames[group_ids] = group_df.copy()
         bin_count = len(group_df)
 
-        sod_pos = group_df["cumulative_pos"].iloc[0]
-        eod_pos = group_df["cumulative_pos"].iloc[-1]
+        sod_pos = group_df["exposure_eur"].iloc[0]
+        eod_pos = group_df["exposure_eur"].iloc[-1]
         # Position entering the day before any first-hour trading (prior EOD carry-over).
-        prior_eod_pos = sod_pos - group_df["signed_qty"].iloc[0]
+        prior_eod_contracts = (
+            group_df["cumulative_contracts"].iloc[0]
+            - group_df["net_contracts"].iloc[0]
+        )
+        prior_eod_pos = prior_eod_contracts * group_df["vwap_eur"].iloc[0]
 
-        max_exposure = group_df["cumulative_pos"].abs().max()
+        max_exposure = group_df["exposure_eur"].abs().max()
         sod_exposure = abs(sod_pos)
         prior_eod_exposure = abs(prior_eod_pos)
         eod_exposure = abs(eod_pos)
@@ -470,9 +488,9 @@ def analyze_intraday_leakage_continuous(
 
             sod_time = group_df["hour_bucket"].iloc[0]
             eod_time = group_df["hour_bucket"].iloc[-1]
-            sod_pos = group_df["cumulative_pos"].iloc[0]
-            eod_pos = group_df["cumulative_pos"].iloc[-1]
-            max_exposure = group_df["cumulative_pos"].abs().max()
+            sod_pos = group_df["exposure_eur"].iloc[0]
+            eod_pos = group_df["exposure_eur"].iloc[-1]
+            max_exposure = group_df["exposure_eur"].abs().max()
 
             fig, ax = plt.subplots(figsize=(11, 6))
 
@@ -484,13 +502,13 @@ def analyze_intraday_leakage_continuous(
 
             ax.bar(
                 hour_bin_starts,
-                group_df["cumulative_pos"],
+                group_df["exposure_eur"],
                 width=timedelta(hours=1),
                 align="edge",
                 alpha=0.85,
                 edgecolor="#1f1f1f",
                 linewidth=0.6,
-                label="Hourly Cumulative Position",
+                label="Hourly Mark-to-Market Exposure (EUR)",
             )
 
             ax.plot(
@@ -517,7 +535,7 @@ def analyze_intraday_leakage_continuous(
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
             ax.axhline(0, color="black", linewidth=0.5)
             ax.set_xlabel(f"Hour ({local_tz_name})")
-            ax.set_ylabel("Position")
+            ax.set_ylabel("Exposure (EUR)")
             ax.tick_params(axis="x", labelrotation=45)
             ax.legend()
             ax.grid(axis="y", linestyle=":", alpha=0.5)
@@ -534,7 +552,7 @@ def analyze_intraday_leakage_continuous(
     # 7) Map flagged leakage cases back to the original trade-level DataFrame.
     leakage_summary = results_df[results_df["Leakage_Detected"]].copy()
 
-    # Enrich the working df with execDate (already has execTime_parsed & signed_qty).
+    # Enrich the working df with execDate (already has execTime_parsed & signed_contracts).
     df["execDate"] = df["execTime_parsed"].apply(
         lambda ts: ts.date() if ts is not None else None
     )
