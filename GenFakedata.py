@@ -36,7 +36,7 @@ def generate_market_data(rows=100000):
     data = {
         "dealNature": "REGULAR_MARKET",
         "dealId": np.random.randint(100000000, 999999999, rows).astype(np.int64),
-        "dealType": "SHA",
+        "dealType": np.random.choice(["SHA", "FUT"], rows),
         # Formatting all dates to YYYY-MM-DD+01:00[Europe/Paris]
         "inputDate": [d.strftime(f"%Y-%m-%d{suffix}") for d in base_dates],
         "tradeDate": [d.strftime(f"%Y-%m-%d{suffix}") for d in base_dates],
@@ -60,16 +60,16 @@ def generate_market_data(rows=100000):
             for t in exec_times
         ],
         "underlyingCurrency": np.random.choice(currencies, rows),
-        "underlyingType": "Stock",
+        "underlyingType": np.random.choice(["Stock", "Index"], rows),
         "underlyingName": "",  # Populated below
+        "GPRC2": np.random.choice(["ASI", "EUR"], rows),
     }
+
+    # Add new column for future point value as random float
+    data["futurePointValue"] = np.random.uniform(0.1, 100.0, rows).round(4)
 
     df = pd.DataFrame(data)
     df["underlyingName"] = df["assetName"]
-
-    # CRITICAL: We add a hidden "trade_sequence" to maintain order
-    # since execTime no longer has seconds/minutes.
-    df["trade_sequence"] = np.arange(len(df))
 
     return df
 
