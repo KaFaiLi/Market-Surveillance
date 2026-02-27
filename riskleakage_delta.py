@@ -410,6 +410,8 @@ def analyze_intraday_leakage_continuous(
     df["signed_qty"] = np.where(
         df["way"].str.upper() == "BUY", df["quantity"], -df["quantity"]
     )
+    df["signed_qty_fut"] = np.where(df["dealType_upper"] == "FUT", df["signed_qty"], 0.0)
+    df["signed_qty_sha"] = np.where(df["dealType_upper"] == "SHA", df["signed_qty"], 0.0)
 
     # Per-trade delta notional (EUR):
     #   FUT: signed_qty × price × futurePointValue × FX
@@ -419,6 +421,8 @@ def analyze_intraday_leakage_continuous(
         df["signed_qty"] * df["premium_numeric"] * df["futurePointValue_numeric"] * df["rate_to_eur"],
         df["beta"] * df["premium_numeric"] * df["signed_qty"] * df["rate_to_eur"],
     )
+    df["delta_notional_fut"] = np.where(df["dealType_upper"] == "FUT", df["delta_notional"], 0.0)
+    df["delta_notional_sha"] = np.where(df["dealType_upper"] == "SHA", df["delta_notional"], 0.0)
 
     # 3) Aggregate signed flow by local-hour bucket per position key.
     #    Sort by execution time so 'last' picks the latest traded price per hour.
@@ -427,7 +431,11 @@ def analyze_intraday_leakage_continuous(
         df.groupby(position_keys + ["hour_bucket"])
         .agg(
             signed_qty=("signed_qty", "sum"),
+            signed_qty_fut=("signed_qty_fut", "sum"),
+            signed_qty_sha=("signed_qty_sha", "sum"),
             delta_notional=("delta_notional", "sum"),
+            delta_notional_fut=("delta_notional_fut", "sum"),
+            delta_notional_sha=("delta_notional_sha", "sum"),
             latest_price=("premium_numeric", "last"),
             latest_fpv=("futurePointValue_numeric", "last"),
             rate_to_eur=("rate_to_eur", "first"),
@@ -440,6 +448,12 @@ def analyze_intraday_leakage_continuous(
     # 4) Rebuild position path from hourly net flow.
     hourly_net["cumulative_pos"] = hourly_net.groupby(position_keys)[
         "signed_qty"
+    ].cumsum()
+    hourly_net["cumulative_delta_exposure_fut"] = hourly_net.groupby(position_keys)[
+        "delta_notional_fut"
+    ].cumsum()
+    hourly_net["cumulative_delta_exposure_sha"] = hourly_net.groupby(position_keys)[
+        "delta_notional_sha"
     ].cumsum()
 
     # Forward-fill latest price and FPV within each position group across hours.
@@ -683,20 +697,34 @@ def analyze_intraday_leakage_continuous(
 
             hour_bin_starts = group_df["hour_bucket"]
             hour_bin_centers = hour_bin_starts + timedelta(minutes=30)
+            hour_bin_centers_num = mdates.date2num(hour_bin_centers)
+            cluster_bar_width_days = (1.0 / 24.0) * 0.35
             sod_time_center = sod_time + timedelta(minutes=30)
             eod_time_center = eod_time + timedelta(minutes=30)
             local_tz_name = _currency_to_timezone(row["Currency"]) or "UTC"
 
             ax.bar(
-                hour_bin_starts,
-                group_df["cumulative_pos"],
-                width=timedelta(hours=1),
-                align="edge",
+                hour_bin_centers_num - (cluster_bar_width_days / 2.0),
+                group_df["signed_qty_sha"],
+                width=cluster_bar_width_days,
+                align="center",
                 alpha=0.65,
                 edgecolor="#1f1f1f",
                 linewidth=0.6,
                 color="#6baed6",
-                label="Cumulative Position (qty)",
+                label="Share Qty (SHA)",
+            )
+
+            ax.bar(
+                hour_bin_centers_num + (cluster_bar_width_days / 2.0),
+                group_df["signed_qty_fut"],
+                width=cluster_bar_width_days,
+                align="center",
+                alpha=0.65,
+                edgecolor="#1f1f1f",
+                linewidth=0.6,
+                color="#9ecae1",
+                label="Future Qty (FUT)",
             )
 
             ax.plot(
@@ -721,7 +749,25 @@ def analyze_intraday_leakage_continuous(
                 linewidth=2.5,
                 marker="s",
                 markersize=4,
-                label="Delta Exposure (EUR)",
+                label="Total Delta Exposure (EUR)",
+            )
+            ax2.plot(
+                hour_bin_centers,
+                group_df["cumulative_delta_exposure_fut"],
+                color="#ff7f0e",
+                linewidth=1.8,
+                marker="^",
+                markersize=3,
+                label="Future Delta Exposure (EUR)",
+            )
+            ax2.plot(
+                hour_bin_centers,
+                group_df["cumulative_delta_exposure_sha"],
+                color="#9467bd",
+                linewidth=1.8,
+                marker="v",
+                markersize=3,
+                label="Share Delta Exposure (EUR)",
             )
             ax2.set_ylabel("Delta Exposure (EUR)", color="#d62728")
             ax2.tick_params(axis="y", labelcolor="#d62728")
