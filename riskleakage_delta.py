@@ -159,7 +159,7 @@ def _write_audit_report(
         sorted_leakage = leakage_df.sort_values("Delta_Leakage_Gap", ascending=False).reset_index(drop=True)
         t3 = PrettyTable()
         t3.field_names = [
-            "#", "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
+            "#", "ExecDate", "Portfolio", "DealType", "Underlying", "Maturity", "Currency",
             "Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap",
             "SOD_Delta", "EOD_Delta", "Max_Delta", "Delta_Gap",
         ]
@@ -171,6 +171,7 @@ def _write_audit_report(
                 i + 1,
                 row["ExecDate"],
                 row["Portfolio"],
+                row["DealType"],
                 row["Underlying"],
                 row["Maturity"],
                 row["Currency"],
@@ -195,7 +196,7 @@ def _write_audit_report(
             w(sep)
 
             grp_summary = (
-                flagged_trades_df.groupby(["ExecDate", "Portfolio", "Underlying", "Maturity", "Currency"])
+                flagged_trades_df.groupby(["ExecDate", "Portfolio", "DealType", "Underlying", "Maturity", "Currency"])
                 .agg(
                     Trade_Count=("signed_qty", "count"),
                     Gross_Buy_Qty=("signed_qty", lambda x: x[x > 0].sum()),
@@ -208,7 +209,7 @@ def _write_audit_report(
 
             t4 = PrettyTable()
             t4.field_names = [
-                "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
+                "ExecDate", "Portfolio", "DealType", "Underlying", "Maturity", "Currency",
                 "Trades", "Gross Buy", "Gross Sell", "Net Qty",
             ]
             for col in ["Trades", "Gross Buy", "Gross Sell", "Net Qty"]:
@@ -217,6 +218,7 @@ def _write_audit_report(
                 t4.add_row([
                     row["ExecDate"],
                     row["Portfolio"],
+                    row.get("DealType", "N/A"),
                     row["Underlying"],
                     row["Maturity"],
                     row["Currency"],
@@ -349,7 +351,7 @@ def analyze_intraday_leakage_continuous(
     if max_plots is not None and max_plots < 0:
         raise ValueError("max_plots must be >= 0 when provided.")
 
-    position_keys = ["portfolioId", "underlyingId", "maturity", "underlyingCurrency"]
+    position_keys = ["portfolioId", "dealType_upper", "underlyingId", "maturity", "underlyingCurrency"]
 
     # 1) Parse execution timestamp and group by parsed-hour bucket.
     df["market_timezone"] = df.get(
@@ -475,10 +477,10 @@ def analyze_intraday_leakage_continuous(
     summary_data = []
     group_frames = {}
     underlying_prior_eod_deltas = {}  # Store per-underlying prior-EOD delta for portfolio agg.
-    daily_keys = ["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"]
+    daily_keys = ["execDate", "portfolioId", "dealType", "underlyingId", "maturity", "underlyingCurrency"]
 
     for group_ids, group_df in hourly_net.groupby(daily_keys):
-        exec_date, port, und, mat, ccy = group_ids
+        exec_date, port, deal_type, und, mat, ccy = group_ids
         group_df = group_df.sort_values("hour_bucket", kind="mergesort")
         if debug_sorting:
             first_bucket = group_df["hour_bucket"].iloc[0]
@@ -486,7 +488,7 @@ def analyze_intraday_leakage_continuous(
                 if first_bucket.hour != expected_start_hour:
                     print(
                         "Warning: first hour_bucket is not the expected start hour for "
-                        f"{exec_date} | {port} | {und} | {mat} | {ccy}. "
+                        f"{exec_date} | {port} | {deal_type} | {und} | {mat} | {ccy}. "
                         f"First bucket: {first_bucket}"
                     )
                     print(group_df["hour_bucket"].head(10).to_string(index=False))
@@ -537,6 +539,7 @@ def analyze_intraday_leakage_continuous(
             {
                 "ExecDate": exec_date,
                 "Portfolio": port,
+                "DealType": deal_type,
                 "Underlying": und,
                 "Maturity": mat,
                 "Currency": ccy,
@@ -568,6 +571,8 @@ def analyze_intraday_leakage_continuous(
     # 5b) Portfolio-level delta exposure aggregation and leakage detection.
     portfolio_data = []
     portfolio_group_frames = {}
+    portfolio_dealtype_breakdown = []
+    portfolio_underlying_breakdown = []
 
     for (exec_date, port), _ in hourly_net.groupby(["execDate", "portfolioId"]):
         mask = (hourly_net["execDate"] == exec_date) & (hourly_net["portfolioId"] == port)
@@ -576,18 +581,72 @@ def analyze_intraday_leakage_continuous(
         if len(all_hours) == 0:
             continue
 
-        # Forward-fill each underlying's delta exposure into the full hour grid, then sum.
-        underlying_cols = []
-        for _, udf in pdf.groupby(["underlyingId", "maturity", "underlyingCurrency"]):
+        # Forward-fill each instrument/underlying/maturity path into full hour grid, then sum.
+        path_cols = []
+        for _, udf in pdf.groupby(["dealType", "underlyingId", "maturity", "underlyingCurrency"]):
             udf_indexed = udf.set_index("hour_bucket")["cumulative_delta_exposure"]
             udf_reindexed = udf_indexed.reindex(all_hours).ffill().fillna(0)
-            underlying_cols.append(udf_reindexed)
+            path_cols.append(udf_reindexed)
 
-        portfolio_exposure = pd.concat(underlying_cols, axis=1).sum(axis=1)
-        pf_df = pd.DataFrame({
-            "hour_bucket": all_hours,
-            "portfolio_delta_exposure": portfolio_exposure.values,
-        }).sort_values("hour_bucket")
+        portfolio_exposure = pd.concat(path_cols, axis=1).sum(axis=1)
+
+        # Instrument contribution (FUT vs SHA) at portfolio level.
+        fut_series = pd.Series(0.0, index=all_hours)
+        sha_series = pd.Series(0.0, index=all_hours)
+        for deal_type, ddf in pdf.groupby("dealType"):
+            dseries = (
+                ddf.groupby("hour_bucket")["cumulative_delta_exposure"]
+                .sum()
+                .reindex(all_hours)
+                .ffill()
+                .fillna(0)
+            )
+            if deal_type == "FUT":
+                fut_series = dseries
+            elif deal_type == "SHA":
+                sha_series = dseries
+
+        # Underlying contribution by instrument type.
+        for (deal_type, underlying_id), udf in pdf.groupby(["dealType", "underlyingId"]):
+            useq = (
+                udf.groupby("hour_bucket")["cumulative_delta_exposure"]
+                .sum()
+                .reindex(all_hours)
+                .ffill()
+                .fillna(0)
+            )
+            for hour_bucket, delta_exposure in useq.items():
+                portfolio_underlying_breakdown.append(
+                    {
+                        "ExecDate": exec_date,
+                        "Portfolio": port,
+                        "Hour_Bucket": hour_bucket,
+                        "DealType": deal_type,
+                        "Underlying": underlying_id,
+                        "Delta_Exposure": float(delta_exposure),
+                    }
+                )
+
+        for hour_bucket, fut_exp, sha_exp in zip(all_hours, fut_series.values, sha_series.values):
+            portfolio_dealtype_breakdown.append(
+                {
+                    "ExecDate": exec_date,
+                    "Portfolio": port,
+                    "Hour_Bucket": hour_bucket,
+                    "FUT_Delta_Exposure": float(fut_exp),
+                    "SHA_Delta_Exposure": float(sha_exp),
+                    "Total_Delta_Exposure": float(fut_exp + sha_exp),
+                }
+            )
+
+        pf_df = pd.DataFrame(
+            {
+                "hour_bucket": all_hours,
+                "portfolio_delta_exposure": portfolio_exposure.values,
+                "portfolio_delta_exposure_fut": fut_series.values,
+                "portfolio_delta_exposure_sha": sha_series.values,
+            }
+        ).sort_values("hour_bucket")
         portfolio_group_frames[(exec_date, port)] = pf_df.copy()
 
         pf_bin_count = len(pf_df)
@@ -595,11 +654,11 @@ def analyze_intraday_leakage_continuous(
         pf_eod_delta = pf_df["portfolio_delta_exposure"].iloc[-1]
         pf_max_delta = pf_df["portfolio_delta_exposure"].abs().max()
 
-        # Portfolio prior-EOD = sum of per-underlying prior-EOD deltas.
+        # Portfolio prior-EOD = sum of per-underlying + dealType prior-EOD deltas.
         pf_prior_eod_delta = sum(
-            underlying_prior_eod_deltas.get((exec_date, port, u, m, c), 0)
-            for (u, m, c) in pdf.groupby(
-                ["underlyingId", "maturity", "underlyingCurrency"]
+            underlying_prior_eod_deltas.get((exec_date, port, dt, u, m, c), 0)
+            for (dt, u, m, c) in pdf.groupby(
+                ["dealType", "underlyingId", "maturity", "underlyingCurrency"]
             ).groups.keys()
         )
 
@@ -621,22 +680,26 @@ def analyze_intraday_leakage_continuous(
             and (pf_max_delta > pf_prior_eod_abs)
         )
 
-        portfolio_data.append({
-            "ExecDate": exec_date,
-            "Portfolio": port,
-            "Bin_Count": pf_bin_count,
-            "Prior_EOD_Delta_Exposure": pf_prior_eod_delta,
-            "SOD_Delta_Exposure": pf_sod_delta,
-            "EOD_Delta_Exposure": pf_eod_delta,
-            "Max_Intraday_Delta_Exposure": pf_max_delta,
-            "Delta_Leakage_Gap": pf_delta_gap,
-            "Delta_Max_to_EOD_Ratio": pf_max_to_eod,
-            "Delta_Max_to_Prior_EOD_Ratio": pf_max_to_prior_eod,
-            "Delta_Max_to_Baseline_EOD_Ratio": pf_max_to_baseline,
-            "Leakage_Detected": pf_is_leakage,
-        })
+        portfolio_data.append(
+            {
+                "ExecDate": exec_date,
+                "Portfolio": port,
+                "Bin_Count": pf_bin_count,
+                "Prior_EOD_Delta_Exposure": pf_prior_eod_delta,
+                "SOD_Delta_Exposure": pf_sod_delta,
+                "EOD_Delta_Exposure": pf_eod_delta,
+                "Max_Intraday_Delta_Exposure": pf_max_delta,
+                "Delta_Leakage_Gap": pf_delta_gap,
+                "Delta_Max_to_EOD_Ratio": pf_max_to_eod,
+                "Delta_Max_to_Prior_EOD_Ratio": pf_max_to_prior_eod,
+                "Delta_Max_to_Baseline_EOD_Ratio": pf_max_to_baseline,
+                "Leakage_Detected": pf_is_leakage,
+            }
+        )
 
     portfolio_results_df = pd.DataFrame(portfolio_data)
+    portfolio_dealtype_df = pd.DataFrame(portfolio_dealtype_breakdown)
+    portfolio_underlying_df = pd.DataFrame(portfolio_underlying_breakdown)
 
     # 6) Plot only the highest-ranked flagged leakage groups.
     metric_candidates = {
@@ -665,6 +728,7 @@ def analyze_intraday_leakage_continuous(
             group_ids = (
                 row["ExecDate"],
                 row["Portfolio"],
+                row["DealType"],
                 row["Underlying"],
                 row["Maturity"],
                 row["Currency"],
@@ -678,7 +742,7 @@ def analyze_intraday_leakage_continuous(
             if debug_sorting:
                 print(
                     f"\n[PLOT DEBUG] Group: {row['ExecDate']} | {row['Portfolio']} | "
-                    f"{row['Underlying']} | {row['Maturity']} | {row['Currency']}"
+                    f"{row['DealType']} | {row['Underlying']} | {row['Maturity']} | {row['Currency']}"
                 )
                 print(f"  Buckets ({len(group_df)} total, earliest 5):")
                 print(group_df["hour_bucket"].head(5).to_string(index=False))
@@ -784,7 +848,7 @@ def analyze_intraday_leakage_continuous(
             ax.grid(axis="y", linestyle=":", alpha=0.5)
 
             safe_name = (
-                f"{row['ExecDate']}_{row['Portfolio']}_{row['Underlying']}_{row['Currency']}".replace(
+                f"{row['ExecDate']}_{row['Portfolio']}_{row['DealType']}_{row['Underlying']}_{row['Currency']}".replace(
                     ":", ""
                 ).replace("/", "-")
             )
@@ -839,6 +903,24 @@ def analyze_intraday_leakage_continuous(
                 color="red", linestyle="--", linewidth=2, marker="o",
                 label="SOD→EOD",
             )
+            ax.plot(
+                h_centers,
+                pf_df["portfolio_delta_exposure_fut"],
+                color="#ff7f0e",
+                linewidth=1.8,
+                marker="^",
+                markersize=3,
+                label="FUT Delta Exposure (EUR)",
+            )
+            ax.plot(
+                h_centers,
+                pf_df["portfolio_delta_exposure_sha"],
+                color="#9467bd",
+                linewidth=1.8,
+                marker="v",
+                markersize=3,
+                label="SHA Delta Exposure (EUR)",
+            )
             ax.set_title(
                 f"Portfolio Delta Exposure – Intraday Path\n"
                 f"{prow['Portfolio']} | {prow['ExecDate']}\n"
@@ -875,13 +957,18 @@ def analyze_intraday_leakage_continuous(
         columns={
             "ExecDate": "execDate",
             "Portfolio": "portfolioId",
+            "DealType": "dealType_upper",
             "Underlying": "underlyingId",
             "Maturity": "maturity",
             "Currency": "underlyingCurrency",
         }
-    )[["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"]].copy()
+    )[["execDate", "portfolioId", "dealType_upper", "underlyingId", "maturity", "underlyingCurrency"]].copy()
     leakage_flag_keys["_flagged"] = True
-    df_flagged = df.merge(leakage_flag_keys, on=["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"], how="left")
+    df_flagged = df.merge(
+        leakage_flag_keys,
+        on=["execDate", "portfolioId", "dealType_upper", "underlyingId", "maturity", "underlyingCurrency"],
+        how="left",
+    )
     flagged_trades_df = df_flagged[df_flagged["_flagged"] == True].drop(columns=["_flagged"]).copy()
 
     # Merge leakage metrics into the flagged trades for full context.
@@ -889,11 +976,12 @@ def analyze_intraday_leakage_continuous(
         columns={
             "ExecDate": "execDate",
             "Portfolio": "portfolioId",
+            "DealType": "dealType_upper",
             "Underlying": "underlyingId",
             "Maturity": "maturity",
             "Currency": "underlyingCurrency",
         }
-    )[["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency",
+    )[["execDate", "portfolioId", "dealType_upper", "underlyingId", "maturity", "underlyingCurrency",
        "Prior_EOD_Position", "SOD_Position", "EOD_Position",
        "Max_Intraday_Position", "Leakage_Gap", "Max_to_EOD_Ratio",
        "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio",
@@ -904,7 +992,7 @@ def analyze_intraday_leakage_continuous(
 
     flagged_trades_df = flagged_trades_df.merge(
         leakage_merge,
-        on=["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"],
+        on=["execDate", "portfolioId", "dealType_upper", "underlyingId", "maturity", "underlyingCurrency"],
         how="left",
     )
 
@@ -913,6 +1001,7 @@ def analyze_intraday_leakage_continuous(
         columns={
             "execDate": "ExecDate",
             "portfolioId": "Portfolio",
+            "dealType_upper": "DealType",
             "underlyingId": "Underlying",
             "maturity": "Maturity",
             "underlyingCurrency": "Currency",
@@ -929,6 +1018,12 @@ def analyze_intraday_leakage_continuous(
     portfolio_csv = os.path.join(output_folder, "Portfolio_Delta_Exposure_Report.csv")
     portfolio_results_df.to_csv(portfolio_csv, index=False)
 
+    portfolio_dealtype_csv = os.path.join(output_folder, "Portfolio_DealType_Delta_Contribution.csv")
+    portfolio_dealtype_df.to_csv(portfolio_dealtype_csv, index=False)
+
+    portfolio_underlying_csv = os.path.join(output_folder, "Portfolio_Underlying_DealType_Delta_Contribution.csv")
+    portfolio_underlying_df.to_csv(portfolio_underlying_csv, index=False)
+
     # 9) Write auditor report to text file.
     audit_report_path = os.path.join(output_folder, "Audit_Report.txt")
     _write_audit_report(results_df, flagged_trades_df, audit_report_path, portfolio_results_df)
@@ -938,6 +1033,8 @@ def analyze_intraday_leakage_continuous(
     print(f"Full Report                  : {csv_path}")
     print(f"Flagged Trades CSV           : {flagged_trades_csv}")
     print(f"Portfolio Delta Report        : {portfolio_csv}")
+    print(f"Portfolio DealType Contribution: {portfolio_dealtype_csv}")
+    print(f"Portfolio Underlying Contribution: {portfolio_underlying_csv}")
     print(f"Audit Report TXT             : {audit_report_path}")
 
     return results_df, flagged_trades_df, portfolio_results_df
