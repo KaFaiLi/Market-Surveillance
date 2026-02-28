@@ -66,7 +66,7 @@ def generate_market_data(rows=100000):
     }
 
     # Add new column for future point value as random float
-    data["futurePointValue"] = np.random.uniform(0.1, 100.0, rows).round(4)
+    data["futurePointValue"] = np.random.uniform(0.1, 3.0, rows).round(4)
 
     df = pd.DataFrame(data)
     df["underlyingName"] = df["assetName"]
