@@ -16,7 +16,7 @@ def generate_market_data(rows=100000):
 
     # Generate random dates over a 30-day period for 2024
     base_dates = [
-        datetime(2024, 1, 16) + timedelta(days=np.random.randint(0, 30))
+        datetime(2024, 1, 2) + timedelta(days=np.random.randint(0, 30))
         for _ in range(rows)
     ]
 

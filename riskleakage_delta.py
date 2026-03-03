@@ -242,10 +242,63 @@ def _load_currency_rates(rate_path):
     return rates_long[["rate_date", "currency", "rate_to_eur"]]
 
 
+def _load_initial_positions(path):
+    """Load prior-EOD positions and return FUT and SHA lookup DataFrames.
+
+    The position file is expected to have at minimum:
+        position_category  – "futurePosition" or "stockPosition"
+        portfolioId        – matches trade portfolioId
+        underlyingId       – matches trade underlyingId
+        maturity           – may contain TZ suffix (e.g. "2024-06-21+01:00[Europe/Paris]")
+        payCurId           – currency, matched to trade underlyingCurrency
+        position           – signed quantity (prior-EOD position)
+
+    Returns
+    -------
+    fut_pos : DataFrame  [portfolioId, underlyingId, maturity_key, underlyingCurrency, initial_pos]
+    sha_pos : DataFrame  [portfolioId, underlyingId, underlyingCurrency, initial_pos]
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Initial positions file not found: {path}")
+
+    pos_df = pd.read_csv(path, dtype=str)
+
+    # Normalise maturity to bare date string – strip TZ offset and bracketed zone.
+    # e.g. "2024-06-21+01:00[Europe/Paris]" → "2024-06-21"
+    pos_df["maturity_key"] = (
+        pos_df["maturity"]
+        .astype(str)
+        .str.split(r"[\+\[]", regex=True)
+        .str[0]
+        .str.strip()
+    )
+
+    pos_df["underlyingCurrency"] = pos_df["payCurId"].str.upper().str.strip()
+    pos_df["initial_pos"] = pd.to_numeric(pos_df["position"], errors="coerce").fillna(0.0)
+
+    fut_pos = (
+        pos_df[pos_df["position_category"] == "futurePosition"]
+        [["portfolioId", "underlyingId", "maturity_key", "underlyingCurrency", "initial_pos"]]
+        .copy()
+    )
+
+    sha_pos = (
+        pos_df[pos_df["position_category"] == "stockPosition"]
+        [["portfolioId", "underlyingId", "underlyingCurrency", "initial_pos"]]
+        .copy()
+    )
+
+    print(f"Initial positions loaded     : {len(pos_df):,} rows "
+          f"({len(fut_pos):,} FUT, {len(sha_pos):,} SHA) from {path}")
+
+    return fut_pos, sha_pos
+
+
 def analyze_intraday_leakage_continuous(
     df,
     output_folder="hourly_risk_analysis_continuous",
     currency_rates_path="output/currency_rates.xlsx",
+    initial_positions_path=None,
     plot_top_pct=5,
     plot_metric="Delta_Leakage_Gap",
     max_plots=None,
@@ -271,6 +324,11 @@ def analyze_intraday_leakage_continuous(
         futurePointValue, premium.
     output_folder : str
     currency_rates_path : str
+    initial_positions_path : str or None
+        Path to the prior-EOD position CSV.  When provided the cumulative
+        position for every product is seeded from this file instead of zero.
+        Matched on (portfolioId, underlyingId, underlyingCurrency) for SHA and
+        (portfolioId, underlyingId, maturity_key, underlyingCurrency) for FUT.
     plot_top_pct : float  (0–100)
     plot_metric : str
     max_plots : int or None
@@ -284,6 +342,13 @@ def analyze_intraday_leakage_continuous(
     """
     os.makedirs(output_folder, exist_ok=True)
     df = df.copy()
+
+    # ── 0. Load initial (prior-EOD) positions ──────────────────────────
+    fut_init_pos = pd.DataFrame()
+    sha_init_pos = pd.DataFrame()
+    if initial_positions_path is not None:
+        fut_init_pos, sha_init_pos = _load_initial_positions(initial_positions_path)
+
     if plot_top_pct < 0 or plot_top_pct > 100:
         raise ValueError("plot_top_pct must be between 0 and 100.")
     if max_plots is not None and max_plots < 0:
@@ -373,6 +438,24 @@ def analyze_intraday_leakage_continuous(
             .sort_values(by=fut_keys + ["hour_bucket"], kind="mergesort")
         )
         hourly_fut["cumulative_pos"] = hourly_fut.groupby(fut_keys)["signed_qty"].cumsum()
+
+        # Seed cumulative_pos with prior-EOD position when available.
+        if not fut_init_pos.empty:
+            hourly_fut["maturity_key"] = (
+                hourly_fut["maturity"].astype(str)
+                .str.split(r"[\+\[]", regex=True).str[0].str.strip()
+            )
+            # Coerce join keys to str to match the position lookup (loaded as str).
+            for _col in ["portfolioId", "underlyingId", "underlyingCurrency"]:
+                hourly_fut[_col] = hourly_fut[_col].astype(str)
+            hourly_fut = hourly_fut.merge(
+                fut_init_pos.rename(columns={"initial_pos": "_init_pos"}),
+                on=["portfolioId", "underlyingId", "maturity_key", "underlyingCurrency"],
+                how="left",
+            )
+            hourly_fut["cumulative_pos"] += hourly_fut["_init_pos"].fillna(0.0)
+            hourly_fut = hourly_fut.drop(columns=["_init_pos", "maturity_key"])
+
         hourly_fut["latest_price"] = hourly_fut.groupby(fut_keys)["latest_price"].ffill()
         hourly_fut["latest_fpv"] = hourly_fut.groupby(fut_keys)["latest_fpv"].ffill()
         hourly_fut["latest_price_eur"] = hourly_fut["latest_price"] * hourly_fut["rate_to_eur"]
@@ -399,6 +482,20 @@ def analyze_intraday_leakage_continuous(
             .sort_values(by=sha_keys + ["hour_bucket"], kind="mergesort")
         )
         hourly_sha["cumulative_pos"] = hourly_sha.groupby(sha_keys)["signed_qty"].cumsum()
+
+        # Seed cumulative_pos with prior-EOD position when available.
+        if not sha_init_pos.empty:
+            # Coerce join keys to str to match the position lookup (loaded as str).
+            for _col in ["portfolioId", "underlyingId", "underlyingCurrency"]:
+                hourly_sha[_col] = hourly_sha[_col].astype(str)
+            hourly_sha = hourly_sha.merge(
+                sha_init_pos.rename(columns={"initial_pos": "_init_pos"}),
+                on=["portfolioId", "underlyingId", "underlyingCurrency"],
+                how="left",
+            )
+            hourly_sha["cumulative_pos"] += hourly_sha["_init_pos"].fillna(0.0)
+            hourly_sha = hourly_sha.drop(columns=["_init_pos"])
+
         hourly_sha["latest_price"] = hourly_sha.groupby(sha_keys)["latest_price"].ffill()
         hourly_sha["latest_price_eur"] = hourly_sha["latest_price"] * hourly_sha["rate_to_eur"]
         hourly_sha["delta_nominal"] = (
@@ -775,6 +872,7 @@ if __name__ == "__main__":
     df_trades = pd.read_csv("output/synthetic_trading_data.csv")
     portfolio, flagged = analyze_intraday_leakage_continuous(
         df_trades,
+        initial_positions_path="output/synthetic_position_data_clean.csv",
         plot_top_pct=5,
         plot_metric="Delta_Max_to_Baseline_Ratio",
         max_plots=20,
