@@ -184,7 +184,7 @@ def _write_audit_report(
             w(sep)
 
             grp_summary = (
-                flagged_trades_df.groupby(["ExecDate", "Portfolio"])
+                flagged_trades_df.groupby(["execDate", "portfolioId"])
                 .agg(
                     Trade_Count=("signed_qty", "count"),
                     Gross_Buy_Qty=("signed_qty", lambda x: x[x > 0].sum()),
@@ -204,8 +204,8 @@ def _write_audit_report(
                 t4.align[col] = "r"
             for _, row in grp_summary.iterrows():
                 t4.add_row([
-                    row["ExecDate"],
-                    row["Portfolio"],
+                    row["execDate"],
+                    row["portfolioId"],
                     f"{int(row['Trade_Count']):,}",
                     f"{row['Gross_Buy_Qty']:>14,.0f}",
                     f"{row['Gross_Sell_Qty']:>14,.0f}",
@@ -341,7 +341,6 @@ def analyze_intraday_leakage_continuous(
         errors="coerce",
     ).fillna(1.0)
     df["dealType_upper"] = df["dealType"].astype("string").str.upper()
-    df["beta"] = 1.0  # placeholder – replace with external beta dataset
 
     # ── 3. Signed quantity ─────────────────────────────────────────────
     df["signed_qty"] = np.where(
@@ -395,7 +394,6 @@ def analyze_intraday_leakage_continuous(
                 signed_qty=("signed_qty", "sum"),
                 latest_price=("premium_numeric", "last"),
                 rate_to_eur=("rate_to_eur", "first"),
-                beta=("beta", "first"),
             )
             .reset_index()
             .sort_values(by=sha_keys + ["hour_bucket"], kind="mergesort")
@@ -406,7 +404,6 @@ def analyze_intraday_leakage_continuous(
         hourly_sha["delta_nominal"] = (
             hourly_sha["cumulative_pos"]
             * hourly_sha["latest_price_eur"]
-            * hourly_sha["beta"]
         )
         hourly_sha["execDate"] = hourly_sha["hour_bucket"].apply(
             lambda ts: ts.date() if ts is not None else None
@@ -487,7 +484,7 @@ def analyze_intraday_leakage_continuous(
                 sha_qty_cols.append(qty_s)
                 first_row = udf.iloc[0]
                 prior_pos = first_row["cumulative_pos"] - first_row["signed_qty"]
-                prior_delta = prior_pos * first_row["latest_price_eur"] * first_row["beta"]
+                prior_delta = prior_pos * first_row["latest_price_eur"]
                 sha_prior_eod_deltas.append(prior_delta)
 
         # Sum across products per deal type.
@@ -607,37 +604,57 @@ def analyze_intraday_leakage_continuous(
             pf_peak = pf_df["portfolio_delta"].abs().max()
             pf_eod = pf_df["portfolio_delta"].iloc[-1]
 
-            fig, ax = plt.subplots(figsize=(12, 6))
+            fig, (ax_sha, ax_fut, ax_delta) = plt.subplots(
+                3, 1,
+                figsize=(14, 10),
+                sharex=True,
+                gridspec_kw={"height_ratios": [1, 1, 2]},
+            )
 
-            # Bars: hourly net quantity by deal type.
-            ax.bar(
-                h_centers_num - (bar_width / 2.0),
+            # ── Panel 1: SHA quantity (independent scale – millions) ───
+            ax_sha.bar(
+                h_centers_num,
                 pf_df["qty_sha"],
-                width=bar_width,
+                width=bar_width * 2,
                 align="center",
-                alpha=0.65,
+                alpha=0.70,
                 edgecolor="#1f1f1f",
                 linewidth=0.6,
                 color="#1f77b4",
                 label="Share Qty (SHA)",
             )
-            ax.bar(
-                h_centers_num + (bar_width / 2.0),
+            ax_sha.set_ylabel("SHA\nNet Qty (shares)", color="#1f77b4", fontsize=9)
+            ax_sha.tick_params(axis="y", labelcolor="#1f77b4")
+            ax_sha.axhline(0, color="black", linewidth=0.5)
+            ax_sha.legend(loc="upper left", fontsize=8)
+            ax_sha.grid(axis="y", linestyle=":", alpha=0.5)
+            ax_sha.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
+            )
+
+            # ── Panel 2: FUT quantity (independent scale – contracts) ──
+            ax_fut.bar(
+                h_centers_num,
                 pf_df["qty_fut"],
-                width=bar_width,
+                width=bar_width * 2,
                 align="center",
-                alpha=0.65,
+                alpha=0.70,
                 edgecolor="#1f1f1f",
                 linewidth=0.6,
                 color="#ff7f0e",
                 label="Future Qty (FUT)",
             )
-            ax.set_ylabel("Net Quantity (contracts / shares)", color="#333333")
-            ax.tick_params(axis="y", labelcolor="#333333")
+            ax_fut.set_ylabel("FUT\nNet Qty (contracts)", color="#ff7f0e", fontsize=9)
+            ax_fut.tick_params(axis="y", labelcolor="#ff7f0e")
+            ax_fut.axhline(0, color="black", linewidth=0.5)
+            ax_fut.legend(loc="upper left", fontsize=8)
+            ax_fut.grid(axis="y", linestyle=":", alpha=0.5)
+            ax_fut.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
+            )
 
-            # Lines: delta exposure on secondary axis.
-            ax2 = ax.twinx()
-            ax2.plot(
+            # ── Panel 3: Delta nominal lines ───────────────────────────
+            ax_delta.plot(
                 h_centers,
                 pf_df["delta_sha"],
                 color="#1f77b4",
@@ -646,7 +663,7 @@ def analyze_intraday_leakage_continuous(
                 markersize=3,
                 label="SHA Delta (EUR)",
             )
-            ax2.plot(
+            ax_delta.plot(
                 h_centers,
                 pf_df["delta_fut"],
                 color="#ff7f0e",
@@ -655,7 +672,7 @@ def analyze_intraday_leakage_continuous(
                 markersize=3,
                 label="FUT Delta (EUR)",
             )
-            ax2.plot(
+            ax_delta.plot(
                 h_centers,
                 pf_df["portfolio_delta"],
                 color="#d62728",
@@ -664,33 +681,31 @@ def analyze_intraday_leakage_continuous(
                 markersize=4,
                 label="Portfolio Delta (EUR)",
             )
-            ax2.set_ylabel("Delta Nominal (EUR)", color="#d62728")
-            ax2.tick_params(axis="y", labelcolor="#d62728")
+            ax_delta.set_ylabel("Delta Nominal (EUR)", color="#333333", fontsize=9)
+            ax_delta.tick_params(axis="y", labelcolor="#333333")
+            ax_delta.axhline(0, color="black", linewidth=0.5)
+            ax_delta.legend(loc="upper left", fontsize=8)
+            ax_delta.grid(axis="y", linestyle=":", alpha=0.5)
+            ax_delta.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
+            )
+            ax_delta.set_xlabel("Hour (local)")
+            ax_delta.tick_params(axis="x", labelrotation=45)
 
-            ax.set_title(
+            # ── Shared X-axis formatting ───────────────────────────────
+            x_start = h_starts.iloc[0]
+            x_end = h_starts.iloc[-1] + timedelta(hours=1)
+            ax_sha.set_xlim(x_start, x_end)
+            ax_sha.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+            ax_sha.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+
+            fig.suptitle(
                 f"Portfolio Delta Nominal Exposure – Intraday Path\n"
                 f"{prow['Portfolio']} | {prow['ExecDate']}\n"
                 f"Peak: {pf_peak:,.0f} EUR | EOD: {pf_eod:,.0f} EUR | "
                 f"{plot_metric}: {prow[plot_metric]:,.2f}",
                 fontsize=10,
             )
-
-            x_start = h_starts.iloc[0]
-            x_end = h_starts.iloc[-1] + timedelta(hours=1)
-            ax.set_xlim(x_start, x_end)
-            ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-            ax.axhline(0, color="black", linewidth=0.5)
-            ax.set_xlabel("Hour (local)")
-            ax.tick_params(axis="x", labelrotation=45)
-
-            # Combined legend.
-            lines1, labels1 = ax.get_legend_handles_labels()
-            lines2, labels2 = ax2.get_legend_handles_labels()
-            ax.legend(
-                lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8
-            )
-            ax.grid(axis="y", linestyle=":", alpha=0.5)
 
             safe_name = (
                 f"{prow['ExecDate']}_{prow['Portfolio']}"
@@ -737,13 +752,6 @@ def analyze_intraday_leakage_continuous(
     flagged_trades_df = flagged_trades_df.merge(
         leakage_merge, on=["execDate", "portfolioId"], how="left",
     )
-    flagged_trades_df = flagged_trades_df.rename(columns={
-        "execDate": "ExecDate",
-        "portfolioId": "Portfolio",
-        "underlyingId": "Underlying",
-        "maturity": "Maturity",
-        "underlyingCurrency": "Currency",
-    })
 
     # ── 8. Export ──────────────────────────────────────────────────────
     portfolio_csv = os.path.join(output_folder, "Portfolio_Delta_Exposure_Report.csv")
