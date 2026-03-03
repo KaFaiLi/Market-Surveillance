@@ -142,5 +142,13 @@ df_positions = generate_position_data(200000)
 os.makedirs("output", exist_ok=True)
 df_positions.to_csv("output/synthetic_position_data_clean.csv", index=False)
 
+parquet_path = "output/synthetic_position_data_clean.parquet"
+try:
+    df_positions.to_parquet(parquet_path, index=False)
+    print("✅ Parquet written:", parquet_path)
+except Exception as e:
+    print("⚠️ Could not write parquet file:", e)
+    print("Install 'pyarrow' or 'fastparquet' to enable parquet export: pip install pyarrow")
+
 print("✅ Clean synthetic stock & future dataset generated.")
 print("No null values:", df_positions.isna().sum().sum())

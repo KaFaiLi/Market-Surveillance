@@ -261,7 +261,12 @@ def _load_initial_positions(path):
     if not os.path.exists(path):
         raise FileNotFoundError(f"Initial positions file not found: {path}")
 
-    pos_df = pd.read_csv(path, dtype=str)
+    pos_df = pd.read_parquet(path)
+
+    # Cast key join columns to str so they match the string-typed trade columns.
+    for _col in ["portfolioId", "underlyingId", "maturity", "payCurId", "position_category"]:
+        if _col in pos_df.columns:
+            pos_df[_col] = pos_df[_col].astype(str)
 
     # Normalise maturity to bare date string – strip TZ offset and bracketed zone.
     # e.g. "2024-06-21+01:00[Europe/Paris]" → "2024-06-21"
@@ -872,7 +877,7 @@ if __name__ == "__main__":
     df_trades = pd.read_csv("output/synthetic_trading_data.csv")
     portfolio, flagged = analyze_intraday_leakage_continuous(
         df_trades,
-        initial_positions_path="output/synthetic_position_data_clean.csv",
+        initial_positions_path="output/synthetic_position_data_clean.parquet",
         plot_top_pct=5,
         plot_metric="Delta_Max_to_Baseline_Ratio",
         max_plots=20,
