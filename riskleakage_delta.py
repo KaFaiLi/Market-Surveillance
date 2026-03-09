@@ -247,17 +247,17 @@ def _load_initial_positions(path):
 
     Matching keys
     -------------
-    FUT : (portfolioId, assetName, maturity_key)
-          assetName    = position-file stockId
-          maturity_key = maturity stripped of TZ suffix
+    FUT : (portfolioId, assetName, maturity)
+          assetName = position-file stockId
+          maturity  = as-is (e.g. "2024-06-21+01:00[Europe/Paris]")
     SHA : (portfolioId, assetName)
-          assetName    = position-file stockId
+          assetName = position-file stockId
 
     Rows with position == 0 are excluded (no impact on seeding).
 
     Returns
     -------
-    fut_pos : DataFrame  [portfolioId, assetName, maturity_key, initial_pos]
+    fut_pos : DataFrame  [portfolioId, assetName, maturity, initial_pos]
     sha_pos : DataFrame  [portfolioId, assetName, initial_pos]
     """
     if not os.path.exists(path):
@@ -274,22 +274,12 @@ def _load_initial_positions(path):
     pos_df["initial_pos"] = pd.to_numeric(pos_df["position"], errors="coerce").fillna(0.0)
     pos_df = pos_df[pos_df["initial_pos"] != 0.0].copy()
 
-    # Normalise maturity to bare date string – strip TZ offset and bracketed zone.
-    # e.g. "2024-06-21+01:00[Europe/Paris]" → "2024-06-21"
-    pos_df["maturity_key"] = (
-        pos_df["maturity"]
-        .astype(str)
-        .str.split(r"[\+\[]", regex=True)
-        .str[0]
-        .str.strip()
-    )
-
     # Rename stockId → assetName to align with the trade file join key.
     pos_df = pos_df.rename(columns={"stockId": "assetName"})
 
     fut_pos = (
         pos_df[pos_df["position_category"] == "futurePosition"]
-        [["portfolioId", "assetName", "maturity_key", "initial_pos"]]
+        [["portfolioId", "assetName", "maturity", "initial_pos"]]
         .copy()
     )
 
@@ -440,17 +430,14 @@ def analyze_intraday_leakage_continuous(
         # Pre-join initial position onto df_fut before groupby (assetName is only on the
         # raw trade rows and is not preserved through the groupby product keys).
         if not fut_init_pos.empty:
-            df_fut["maturity_key"] = (
-                df_fut["maturity"].astype(str)
-                .str.split(r"[\+\[]", regex=True).str[0].str.strip()
-            )
             df_fut["portfolioId"] = df_fut["portfolioId"].astype(str)
             df_fut["assetName"] = df_fut["assetName"].astype(str)
+            df_fut["maturity"] = df_fut["maturity"].astype(str)
             df_fut = df_fut.merge(
                 fut_init_pos,
-                on=["portfolioId", "assetName", "maturity_key"],
+                on=["portfolioId", "assetName", "maturity"],
                 how="left",
-            ).drop(columns=["maturity_key"])
+            )
             df_fut["initial_pos"] = df_fut["initial_pos"].fillna(0.0)
 
             # ── Match diagnostics (FUT) ────────────────────────────────
