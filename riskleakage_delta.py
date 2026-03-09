@@ -245,18 +245,20 @@ def _load_currency_rates(rate_path):
 def _load_initial_positions(path):
     """Load prior-EOD positions and return FUT and SHA lookup DataFrames.
 
-    The position file is expected to have at minimum:
-        position_category  – "futurePosition" or "stockPosition"
-        portfolioId        – matches trade portfolioId
-        underlyingId       – matches trade underlyingId
-        maturity           – may contain TZ suffix (e.g. "2024-06-21+01:00[Europe/Paris]")
-        payCurId           – currency, matched to trade underlyingCurrency
-        position           – signed quantity (prior-EOD position)
+    Matching keys
+    -------------
+    FUT : (portfolioId, assetName, maturity_key)
+          assetName    = position-file stockId
+          maturity_key = maturity stripped of TZ suffix
+    SHA : (portfolioId, assetName)
+          assetName    = position-file stockId
+
+    Rows with position == 0 are excluded (no impact on seeding).
 
     Returns
     -------
-    fut_pos : DataFrame  [portfolioId, underlyingId, maturity_key, underlyingCurrency, initial_pos]
-    sha_pos : DataFrame  [portfolioId, underlyingId, underlyingCurrency, initial_pos]
+    fut_pos : DataFrame  [portfolioId, assetName, maturity_key, initial_pos]
+    sha_pos : DataFrame  [portfolioId, assetName, initial_pos]
     """
     if not os.path.exists(path):
         raise FileNotFoundError(f"Initial positions file not found: {path}")
@@ -264,9 +266,13 @@ def _load_initial_positions(path):
     pos_df = pd.read_parquet(path)
 
     # Cast key join columns to str so they match the string-typed trade columns.
-    for _col in ["portfolioId", "underlyingId", "maturity", "payCurId", "position_category"]:
+    for _col in ["portfolioId", "stockId", "maturity", "position_category"]:
         if _col in pos_df.columns:
             pos_df[_col] = pos_df[_col].astype(str)
+
+    # Convert position to numeric and drop zero-position rows.
+    pos_df["initial_pos"] = pd.to_numeric(pos_df["position"], errors="coerce").fillna(0.0)
+    pos_df = pos_df[pos_df["initial_pos"] != 0.0].copy()
 
     # Normalise maturity to bare date string – strip TZ offset and bracketed zone.
     # e.g. "2024-06-21+01:00[Europe/Paris]" → "2024-06-21"
@@ -278,18 +284,18 @@ def _load_initial_positions(path):
         .str.strip()
     )
 
-    pos_df["underlyingCurrency"] = pos_df["payCurId"].str.upper().str.strip()
-    pos_df["initial_pos"] = pd.to_numeric(pos_df["position"], errors="coerce").fillna(0.0)
+    # Rename stockId → assetName to align with the trade file join key.
+    pos_df = pos_df.rename(columns={"stockId": "assetName"})
 
     fut_pos = (
         pos_df[pos_df["position_category"] == "futurePosition"]
-        [["portfolioId", "underlyingId", "maturity_key", "underlyingCurrency", "initial_pos"]]
+        [["portfolioId", "assetName", "maturity_key", "initial_pos"]]
         .copy()
     )
 
     sha_pos = (
         pos_df[pos_df["position_category"] == "stockPosition"]
-        [["portfolioId", "underlyingId", "underlyingCurrency", "initial_pos"]]
+        [["portfolioId", "assetName", "initial_pos"]]
         .copy()
     )
 
@@ -431,6 +437,54 @@ def analyze_intraday_leakage_continuous(
     # --- FUT hourly aggregation ---
     hourly_fut = pd.DataFrame()
     if not df_fut.empty:
+        # Pre-join initial position onto df_fut before groupby (assetName is only on the
+        # raw trade rows and is not preserved through the groupby product keys).
+        if not fut_init_pos.empty:
+            df_fut["maturity_key"] = (
+                df_fut["maturity"].astype(str)
+                .str.split(r"[\+\[]", regex=True).str[0].str.strip()
+            )
+            df_fut["portfolioId"] = df_fut["portfolioId"].astype(str)
+            df_fut["assetName"] = df_fut["assetName"].astype(str)
+            df_fut = df_fut.merge(
+                fut_init_pos,
+                on=["portfolioId", "assetName", "maturity_key"],
+                how="left",
+            ).drop(columns=["maturity_key"])
+            df_fut["initial_pos"] = df_fut["initial_pos"].fillna(0.0)
+
+            # ── Match diagnostics (FUT) ────────────────────────────────
+            _fut_keys_df = (
+                df_fut[["portfolioId", "assetName", "maturity"]]
+                .drop_duplicates()
+            )
+            _fut_matched = (df_fut["initial_pos"] != 0.0)
+            _fut_matched_keys = (
+                df_fut.loc[_fut_matched, ["portfolioId", "assetName", "maturity"]]
+                .drop_duplicates()
+            )
+            _fut_total   = len(_fut_keys_df)
+            _fut_n_match = len(_fut_matched_keys)
+            _fut_rate    = (_fut_n_match / _fut_total * 100) if _fut_total else 0.0
+            print(
+                f"\nFUT position match           : "
+                f"{_fut_n_match}/{_fut_total} unique products "
+                f"({_fut_rate:.1f} %)"
+            )
+            _fut_unmatched = _fut_keys_df[
+                ~_fut_keys_df.set_index(["portfolioId", "assetName", "maturity"])
+                .index.isin(
+                    _fut_matched_keys.set_index(["portfolioId", "assetName", "maturity"]).index
+                )
+            ]
+            if not _fut_unmatched.empty:
+                print("  Unmatched FUT products (no prior position):")
+                for _, _r in _fut_unmatched.iterrows():
+                    print(f"    portfolio={_r['portfolioId']}  asset={_r['assetName']}  maturity={_r['maturity']}")
+            # ──────────────────────────────────────────────────────────
+        else:
+            df_fut["initial_pos"] = 0.0
+
         hourly_fut = (
             df_fut.groupby(fut_keys + ["hour_bucket"])
             .agg(
@@ -438,28 +492,15 @@ def analyze_intraday_leakage_continuous(
                 latest_price=("premium_numeric", "last"),
                 latest_fpv=("futurePointValue_numeric", "last"),
                 rate_to_eur=("rate_to_eur", "first"),
+                initial_pos=("initial_pos", "first"),
             )
             .reset_index()
             .sort_values(by=fut_keys + ["hour_bucket"], kind="mergesort")
         )
-        hourly_fut["cumulative_pos"] = hourly_fut.groupby(fut_keys)["signed_qty"].cumsum()
-
-        # Seed cumulative_pos with prior-EOD position when available.
-        if not fut_init_pos.empty:
-            hourly_fut["maturity_key"] = (
-                hourly_fut["maturity"].astype(str)
-                .str.split(r"[\+\[]", regex=True).str[0].str.strip()
-            )
-            # Coerce join keys to str to match the position lookup (loaded as str).
-            for _col in ["portfolioId", "underlyingId", "underlyingCurrency"]:
-                hourly_fut[_col] = hourly_fut[_col].astype(str)
-            hourly_fut = hourly_fut.merge(
-                fut_init_pos.rename(columns={"initial_pos": "_init_pos"}),
-                on=["portfolioId", "underlyingId", "maturity_key", "underlyingCurrency"],
-                how="left",
-            )
-            hourly_fut["cumulative_pos"] += hourly_fut["_init_pos"].fillna(0.0)
-            hourly_fut = hourly_fut.drop(columns=["_init_pos", "maturity_key"])
+        hourly_fut["cumulative_pos"] = (
+            hourly_fut.groupby(fut_keys)["signed_qty"].cumsum()
+            + hourly_fut["initial_pos"]
+        )
 
         hourly_fut["latest_price"] = hourly_fut.groupby(fut_keys)["latest_price"].ffill()
         hourly_fut["latest_fpv"] = hourly_fut.groupby(fut_keys)["latest_fpv"].ffill()
@@ -476,30 +517,64 @@ def analyze_intraday_leakage_continuous(
     # --- SHA hourly aggregation ---
     hourly_sha = pd.DataFrame()
     if not df_sha.empty:
+        # Pre-join initial position onto df_sha before groupby.
+        if not sha_init_pos.empty:
+            df_sha["portfolioId"] = df_sha["portfolioId"].astype(str)
+            df_sha["assetName"] = df_sha["assetName"].astype(str)
+            df_sha = df_sha.merge(
+                sha_init_pos,
+                on=["portfolioId", "assetName"],
+                how="left",
+            )
+            df_sha["initial_pos"] = df_sha["initial_pos"].fillna(0.0)
+
+            # ── Match diagnostics (SHA) ────────────────────────────────
+            _sha_keys_df = (
+                df_sha[["portfolioId", "assetName"]]
+                .drop_duplicates()
+            )
+            _sha_matched = (df_sha["initial_pos"] != 0.0)
+            _sha_matched_keys = (
+                df_sha.loc[_sha_matched, ["portfolioId", "assetName"]]
+                .drop_duplicates()
+            )
+            _sha_total   = len(_sha_keys_df)
+            _sha_n_match = len(_sha_matched_keys)
+            _sha_rate    = (_sha_n_match / _sha_total * 100) if _sha_total else 0.0
+            print(
+                f"\nSHA position match           : "
+                f"{_sha_n_match}/{_sha_total} unique products "
+                f"({_sha_rate:.1f} %)"
+            )
+            _sha_unmatched = _sha_keys_df[
+                ~_sha_keys_df.set_index(["portfolioId", "assetName"])
+                .index.isin(
+                    _sha_matched_keys.set_index(["portfolioId", "assetName"]).index
+                )
+            ]
+            if not _sha_unmatched.empty:
+                print("  Unmatched SHA products (no prior position):")
+                for _, _r in _sha_unmatched.iterrows():
+                    print(f"    portfolio={_r['portfolioId']}  asset={_r['assetName']}")
+            # ──────────────────────────────────────────────────────────
+        else:
+            df_sha["initial_pos"] = 0.0
+
         hourly_sha = (
             df_sha.groupby(sha_keys + ["hour_bucket"])
             .agg(
                 signed_qty=("signed_qty", "sum"),
                 latest_price=("premium_numeric", "last"),
                 rate_to_eur=("rate_to_eur", "first"),
+                initial_pos=("initial_pos", "first"),
             )
             .reset_index()
             .sort_values(by=sha_keys + ["hour_bucket"], kind="mergesort")
         )
-        hourly_sha["cumulative_pos"] = hourly_sha.groupby(sha_keys)["signed_qty"].cumsum()
-
-        # Seed cumulative_pos with prior-EOD position when available.
-        if not sha_init_pos.empty:
-            # Coerce join keys to str to match the position lookup (loaded as str).
-            for _col in ["portfolioId", "underlyingId", "underlyingCurrency"]:
-                hourly_sha[_col] = hourly_sha[_col].astype(str)
-            hourly_sha = hourly_sha.merge(
-                sha_init_pos.rename(columns={"initial_pos": "_init_pos"}),
-                on=["portfolioId", "underlyingId", "underlyingCurrency"],
-                how="left",
-            )
-            hourly_sha["cumulative_pos"] += hourly_sha["_init_pos"].fillna(0.0)
-            hourly_sha = hourly_sha.drop(columns=["_init_pos"])
+        hourly_sha["cumulative_pos"] = (
+            hourly_sha.groupby(sha_keys)["signed_qty"].cumsum()
+            + hourly_sha["initial_pos"]
+        )
 
         hourly_sha["latest_price"] = hourly_sha.groupby(sha_keys)["latest_price"].ffill()
         hourly_sha["latest_price_eur"] = hourly_sha["latest_price"] * hourly_sha["rate_to_eur"]
