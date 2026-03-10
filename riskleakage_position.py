@@ -511,24 +511,77 @@ def analyze_intraday_leakage_continuous(
             eod_nominal = group_df["cumulative_nominal"].iloc[-1]
             max_exposure = group_df["cumulative_nominal"].abs().max()
 
-            fig, ax = plt.subplots(figsize=(13, 7))
+            local_tz_name = _currency_to_timezone(row["Currency"]) or "UTC"
 
-            hour_bin_starts = group_df["hour_bucket"]
+            # Build a complete hourly range (fill hours with no trades).
+            all_hours = pd.date_range(start=sod_time, end=eod_time, freq="h")
+            full_df = (
+                pd.DataFrame({"hour_bucket": all_hours})
+                .merge(group_df, on="hour_bucket", how="left")
+            )
+            full_df["signed_nominal"] = full_df["signed_nominal"].fillna(0.0)
+            full_df["buy_nominal"] = full_df["buy_nominal"].fillna(0.0)
+            full_df["sell_nominal"] = full_df["sell_nominal"].fillna(0.0)
+            full_df["trade_count"] = full_df["trade_count"].fillna(0).astype(int)
+            # Forward-fill cumulative nominal so gap hours carry the last position.
+            full_df["cumulative_nominal"] = full_df["cumulative_nominal"].ffill()
+            # If leading hours had no trades, back-fill with SOD position.
+            full_df["cumulative_nominal"] = full_df["cumulative_nominal"].bfill()
+
+            hour_bin_starts = full_df["hour_bucket"]
             hour_bin_centers = hour_bin_starts + timedelta(minutes=30)
             sod_time_center = sod_time + timedelta(minutes=30)
             eod_time_center = eod_time + timedelta(minutes=30)
-            local_tz_name = _currency_to_timezone(row["Currency"]) or "UTC"
 
-            # Layout constants for side-by-side bars within each hour bin.
+            fig, (ax1, ax2) = plt.subplots(
+                2, 1, figsize=(13, 10), sharex=True,
+                gridspec_kw={"height_ratios": [1.2, 1]},
+            )
+
+            # ── Chart 1: Cumulative Position (bars) + SOD→EOD net flow line ──
+            bar_width = timedelta(minutes=50)
+            ax1.bar(
+                hour_bin_starts,
+                full_df["cumulative_nominal"],
+                width=bar_width,
+                align="edge",
+                alpha=0.65,
+                color="#1f77b4",
+                edgecolor="#0d4a8a",
+                linewidth=0.5,
+                label="Cumulative Position (EUR)",
+            )
+
+            # SOD → EOD net flow line.
+            ax1.plot(
+                [sod_time_center, eod_time_center],
+                [sod_nominal, eod_nominal],
+                color="red",
+                linestyle="--",
+                linewidth=3,
+                marker="o",
+                markersize=6,
+                label="Net Flow (SOD to EOD)",
+            )
+
+            ax1.set_ylabel("Nominal (EUR)")
+            ax1.axhline(0, color="black", linewidth=0.5)
+            ax1.legend(loc="upper left", fontsize=8)
+            ax1.grid(axis="y", linestyle=":", alpha=0.5)
+            ax1.set_title(
+                f"Intraday Risk Leakage – Cumulative Position\n"
+                f"{row['Underlying']} ({row['Currency']}) | {row['Portfolio']} | {row['ExecDate']}\n"
+                f"Peak: {max_exposure:,.0f} EUR | EOD: {eod_nominal:,.0f} EUR | {plot_metric}: {row[plot_metric]:,.2f}",
+                fontsize=11,
+            )
+
+            # ── Chart 2: Buy/Sell Nominal (bars) + Trade Count (line) ──
             nom_bar_width = timedelta(minutes=25)
             sell_bar_offset = timedelta(minutes=25)
-            count_bar_offset = timedelta(minutes=10)
-            count_bar_width = timedelta(minutes=30)
 
-            # Buy nominal bars (positive, left-aligned within hour).
-            ax.bar(
+            ax2.bar(
                 hour_bin_starts,
-                group_df["buy_nominal"],
+                full_df["buy_nominal"],
                 width=nom_bar_width,
                 align="edge",
                 alpha=0.65,
@@ -537,11 +590,9 @@ def analyze_intraday_leakage_continuous(
                 linewidth=0.5,
                 label="Buy Nominal (EUR)",
             )
-
-            # Sell nominal bars (shown as negative, offset to right half).
-            ax.bar(
+            ax2.bar(
                 hour_bin_starts + sell_bar_offset,
-                -group_df["sell_nominal"],
+                -full_df["sell_nominal"],
                 width=nom_bar_width,
                 align="edge",
                 alpha=0.65,
@@ -550,68 +601,42 @@ def analyze_intraday_leakage_continuous(
                 linewidth=0.5,
                 label="Sell Nominal (EUR)",
             )
+            ax2.set_ylabel("Nominal (EUR)")
+            ax2.axhline(0, color="black", linewidth=0.5)
 
-            # Cumulative nominal position line.
-            ax.plot(
+            # Trade count as a line on secondary y-axis.
+            ax2b = ax2.twinx()
+            ax2b.plot(
                 hour_bin_centers,
-                group_df["cumulative_nominal"],
-                color="#1f77b4",
-                linewidth=2,
-                marker="s",
-                markersize=4,
-                label="Cumulative Nominal",
-            )
-
-            # SOD → EOD position line (kept from original).
-            ax.plot(
-                [sod_time_center, eod_time_center],
-                [sod_nominal, eod_nominal],
-                color="red",
-                linestyle="--",
-                linewidth=3,
-                marker="o",
-                label="Net Flow (SOD to EOD)",
-            )
-
-            ax.set_ylabel("Nominal (EUR)", color="black")
-            ax.axhline(0, color="black", linewidth=0.5)
-
-            # Secondary y-axis for trade count.
-            ax2 = ax.twinx()
-            ax2.bar(
-                hour_bin_starts + count_bar_offset,
-                group_df["trade_count"],
-                width=count_bar_width,
-                align="edge",
-                alpha=0.25,
+                full_df["trade_count"],
                 color="#ff7f0e",
-                edgecolor="#cc6600",
-                linewidth=0.5,
+                linewidth=1.5,
+                marker="o",
+                markersize=4,
                 label="Trade Count",
             )
-            ax2.set_ylabel("Trade Count", color="#ff7f0e")
-            ax2.tick_params(axis="y", labelcolor="#ff7f0e")
+            ax2b.set_ylabel("Trade Count", color="#ff7f0e")
+            ax2b.tick_params(axis="y", labelcolor="#ff7f0e")
 
-            ax.set_title(
-                f"Intraday Risk Leakage (Nominal)\n"
-                f"{row['Underlying']} ({row['Currency']}) | {row['Portfolio']} | {row['ExecDate']}\n"
-                f"Peak: {max_exposure:,.0f} EUR | EOD: {eod_nominal:,.0f} EUR | {plot_metric}: {row[plot_metric]:,.2f}",
-                fontsize=11,
+            ax2.set_title("Buy / Sell Nominal & Trade Count", fontsize=10)
+
+            # Combine legends from both axes of Chart 2.
+            lines_2a, labels_2a = ax2.get_legend_handles_labels()
+            lines_2b, labels_2b = ax2b.get_legend_handles_labels()
+            ax2.legend(
+                lines_2a + lines_2b, labels_2a + labels_2b,
+                loc="upper left", fontsize=8,
             )
+            ax2.grid(axis="y", linestyle=":", alpha=0.5)
 
-            x_start = group_df["hour_bucket"].iloc[0]
-            x_end = group_df["hour_bucket"].iloc[-1] + timedelta(hours=1)
-            ax.set_xlim(x_start, x_end)
-            ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-            ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-            ax.set_xlabel(f"Hour ({local_tz_name})")
-            ax.tick_params(axis="x", labelrotation=45)
-
-            # Combine legends from both axes.
-            lines_1, labels_1 = ax.get_legend_handles_labels()
-            lines_2, labels_2 = ax2.get_legend_handles_labels()
-            ax.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper left", fontsize=8)
-            ax.grid(axis="y", linestyle=":", alpha=0.5)
+            # Shared x-axis formatting.
+            x_start = hour_bin_starts.iloc[0]
+            x_end = hour_bin_starts.iloc[-1] + timedelta(hours=1)
+            ax2.set_xlim(x_start, x_end)
+            ax2.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+            ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            ax2.set_xlabel(f"Hour ({local_tz_name})")
+            ax2.tick_params(axis="x", labelrotation=45)
 
             safe_name = (
                 f"{row['ExecDate']}_{row['Portfolio']}_{row['Underlying']}_{row['Currency']}".replace(
