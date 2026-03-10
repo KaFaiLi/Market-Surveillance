@@ -114,14 +114,17 @@ def _write_audit_report(
         w(sep)
 
         metrics = [
-            "Prior_EOD_Position",
-            "SOD_Position",
-            "EOD_Position",
-            "Max_Intraday_Position",
+            "Prior_EOD_Nominal",
+            "SOD_Nominal",
+            "EOD_Nominal",
+            "Max_Intraday_Nominal",
             "Leakage_Gap",
             "Max_to_EOD_Ratio",
             "Max_to_Prior_EOD_Ratio",
             "Max_to_Baseline_EOD_Ratio",
+            "Total_Buy_Nominal",
+            "Total_Sell_Nominal",
+            "Total_Trade_Count",
         ]
         t2 = PrettyTable()
         t2.field_names = ["Metric", "Min", "Max", "Mean", "Median"]
@@ -150,9 +153,9 @@ def _write_audit_report(
         t3 = PrettyTable()
         t3.field_names = [
             "#", "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
-            "Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio",
+            "Pre-Market", "SOD_Nom", "EOD_Nom", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio",
         ]
-        for col in ["Pre-Market", "SOD_Pos", "EOD_Pos", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio"]:
+        for col in ["Pre-Market", "SOD_Nom", "EOD_Nom", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio"]:
             t3.align[col] = "r"
         for i, row in sorted_leakage.iterrows():
             t3.add_row([
@@ -162,10 +165,10 @@ def _write_audit_report(
                 row["Underlying"],
                 row["Maturity"],
                 row["Currency"],
-                f"{row['Prior_EOD_Position']:>12,.0f}",
-                f"{row['SOD_Position']:>12,.0f}",
-                f"{row['EOD_Position']:>12,.0f}",
-                f"{row['Max_Intraday_Position']:>12,.0f}",
+                f"{row['Prior_EOD_Nominal']:>12,.0f}",
+                f"{row['SOD_Nominal']:>12,.0f}",
+                f"{row['EOD_Nominal']:>12,.0f}",
+                f"{row['Max_Intraday_Nominal']:>12,.0f}",
                 f"{row['Leakage_Gap']:>12,.2f}",
                 f"{row['Max_to_EOD_Ratio']:>10,.4f}",
                 f"{row['Max_to_Prior_EOD_Ratio']:>15,.4f}",
@@ -184,10 +187,10 @@ def _write_audit_report(
             grp_summary = (
                 flagged_trades_df.groupby(["ExecDate", "Portfolio", "Underlying", "Maturity", "Currency"])
                 .agg(
-                    Trade_Count=("signed_qty", "count"),
-                    Gross_Buy_Qty=("signed_qty", lambda x: x[x > 0].sum()),
-                    Gross_Sell_Qty=("signed_qty", lambda x: x[x < 0].sum()),
-                    Net_Qty=("signed_qty", "sum"),
+                    Trade_Count=("signed_nominal", "count"),
+                    Gross_Buy_Nominal=("buy_nominal", "sum"),
+                    Gross_Sell_Nominal=("sell_nominal", "sum"),
+                    Net_Nominal=("signed_nominal", "sum"),
                 )
                 .reset_index()
                 .sort_values("Trade_Count", ascending=False)
@@ -196,9 +199,9 @@ def _write_audit_report(
             t4 = PrettyTable()
             t4.field_names = [
                 "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
-                "Trades", "Gross Buy", "Gross Sell", "Net Qty",
+                "Trades", "Gross Buy Nom", "Gross Sell Nom", "Net Nominal",
             ]
-            for col in ["Trades", "Gross Buy", "Gross Sell", "Net Qty"]:
+            for col in ["Trades", "Gross Buy Nom", "Gross Sell Nom", "Net Nominal"]:
                 t4.align[col] = "r"
             for _, row in grp_summary.iterrows():
                 t4.add_row([
@@ -208,9 +211,9 @@ def _write_audit_report(
                     row["Maturity"],
                     row["Currency"],
                     f"{int(row['Trade_Count']):,}",
-                    f"{row['Gross_Buy_Qty']:>14,.0f}",
-                    f"{row['Gross_Sell_Qty']:>14,.0f}",
-                    f"{row['Net_Qty']:>14,.0f}",
+                    f"{row['Gross_Buy_Nominal']:>14,.0f}",
+                    f"{row['Gross_Sell_Nominal']:>14,.0f}",
+                    f"{row['Net_Nominal']:>14,.0f}",
                 ])
             w(t4)
 
@@ -219,25 +222,55 @@ def _write_audit_report(
         w(sep + "\n")
 
 
+def _load_currency_rates(rate_path):
+    """Load currency rates and return a long-form DataFrame for merging."""
+    if not os.path.exists(rate_path):
+        raise FileNotFoundError(f"Currency rates not found: {rate_path}")
+
+    rates_df = pd.read_excel(rate_path, sheet_name="Rates")
+    rates_df["rate_date"] = pd.to_datetime(
+        rates_df["REQUEST_DATE"], errors="coerce"
+    ).dt.date
+
+    rate_cols = [col for col in rates_df.columns if col.endswith("_MID")]
+    rates_long = rates_df.melt(
+        id_vars=["rate_date"],
+        value_vars=rate_cols,
+        var_name="currency_mid",
+        value_name="rate_to_eur",
+    )
+    rates_long["currency"] = rates_long["currency_mid"].str.replace(
+        "_MID", "", regex=False
+    )
+
+    return rates_long[["rate_date", "currency", "rate_to_eur"]]
+
+
 def analyze_intraday_leakage_continuous(
     df,
     output_folder="hourly_risk_analysis_continuous",
+    currency_rates_path="output/currency_rates.xlsx",
     plot_top_pct=5,
     plot_metric="Leakage_Gap",
     max_plots=None,
     debug_sorting=False,
     expected_start_hour=9,
 ):
-    """Analyze intraday position leakage from execution-level trades.
+    """Analyze intraday nominal leakage from execution-level trades.
+
+    Nominal is computed per trade as:
+        premium_EUR × quantity × futurePointValue
+    where premium_EUR = premium × FX rate to EUR.
 
     Parameters:
     df: Input trades DataFrame. Expected columns include `execTime`, `way`,
-        `quantity`, `portfolioId`, `underlyingId`, `maturity`, and
-        `underlyingCurrency`.
+        `quantity`, `portfolioId`, `underlyingId`, `maturity`,
+        `underlyingCurrency`, `premium`, and `futurePointValue`.
     output_folder: Folder for report CSV and leakage plots.
+    currency_rates_path: Path to an Excel file with FX rates to EUR.
     plot_top_pct: Percent (0-100) of flagged leakage groups to plot.
     plot_metric: Ranking metric for plot selection. One of
-        `Leakage_Gap`, `Max_Intraday_Position`, `Max_to_EOD_Ratio`,
+        `Leakage_Gap`, `Max_Intraday_Nominal`, `Max_to_EOD_Ratio`,
         `Max_to_Prior_EOD_Ratio`, `Max_to_Baseline_EOD_Ratio`.
     max_plots: Optional hard cap on the number of plots to generate.
 
@@ -274,22 +307,72 @@ def analyze_intraday_leakage_continuous(
     )
     df = df.sort_values("hour_bucket", kind="mergesort").reset_index(drop=True)
 
-    # 2) Signed quantity.
+    # 2) FX rates and nominal computation.
+    df["execDate"] = df["execTime_parsed"].apply(
+        lambda ts: ts.date() if ts is not None else None
+    )
+    df["underlyingCurrency"] = df["underlyingCurrency"].astype("string").str.upper()
+
+    rates_long = _load_currency_rates(currency_rates_path)
+    df = df.merge(
+        rates_long,
+        left_on=["execDate", "underlyingCurrency"],
+        right_on=["rate_date", "currency"],
+        how="left",
+    )
+    df.loc[df["underlyingCurrency"] == "EUR", "rate_to_eur"] = 1.0
+    missing_rates = df[
+        df["rate_to_eur"].isna()
+        & df["underlyingCurrency"].notna()
+        & (df["underlyingCurrency"] != "EUR")
+    ]
+    if not missing_rates.empty:
+        missing_ccy = sorted(missing_rates["underlyingCurrency"].dropna().unique())
+        raise ValueError(
+            f"Missing FX rates for currencies: {', '.join(missing_ccy)} "
+            f"in {currency_rates_path}"
+        )
+
+    df["premium_numeric"] = pd.to_numeric(df["premium"], errors="coerce")
+    df["premium_eur"] = df["premium_numeric"] * df["rate_to_eur"]
+    df["futurePointValue_numeric"] = pd.to_numeric(
+        df.get("futurePointValue", pd.Series(dtype="float64", index=df.index)),
+        errors="coerce",
+    ).fillna(1.0)
+
+    # Nominal = premium_EUR × quantity × futurePointValue
+    df["nominal"] = (
+        df["premium_eur"].abs() * df["quantity"] * df["futurePointValue_numeric"]
+    )
     df["signed_qty"] = np.where(
         df["way"].str.upper() == "BUY", df["quantity"], -df["quantity"]
     )
+    df["signed_nominal"] = np.where(
+        df["way"].str.upper() == "BUY", df["nominal"], -df["nominal"]
+    )
+    df["buy_nominal"] = np.where(
+        df["way"].str.upper() == "BUY", df["nominal"], 0.0
+    )
+    df["sell_nominal"] = np.where(
+        df["way"].str.upper() == "SELL", df["nominal"], 0.0
+    )
 
-    # 3) Aggregate signed flow by local-hour bucket per position key.
+    # 3) Aggregate by local-hour bucket per position key.
     hourly_net = (
-        df.groupby(position_keys + ["hour_bucket"])["signed_qty"]
-        .sum()
+        df.groupby(position_keys + ["hour_bucket"])
+        .agg(
+            signed_nominal=("signed_nominal", "sum"),
+            buy_nominal=("buy_nominal", "sum"),
+            sell_nominal=("sell_nominal", "sum"),
+            trade_count=("signed_nominal", "count"),
+        )
         .reset_index()
         .sort_values(by=position_keys + ["hour_bucket"], kind="mergesort")
     )
 
-    # 4) Rebuild position path from hourly net flow.
-    hourly_net["cumulative_pos"] = hourly_net.groupby(position_keys)[
-        "signed_qty"
+    # 4) Rebuild nominal position path from hourly net nominal flow.
+    hourly_net["cumulative_nominal"] = hourly_net.groupby(position_keys)[
+        "signed_nominal"
     ].cumsum()
     hourly_net["execDate"] = hourly_net["hour_bucket"].apply(
         lambda ts: ts.date() if ts is not None else None
@@ -316,15 +399,15 @@ def analyze_intraday_leakage_continuous(
         group_frames[group_ids] = group_df.copy()
         bin_count = len(group_df)
 
-        sod_pos = group_df["cumulative_pos"].iloc[0]
-        eod_pos = group_df["cumulative_pos"].iloc[-1]
-        # Position entering the day before any first-hour trading (prior EOD carry-over).
-        prior_eod_pos = sod_pos - group_df["signed_qty"].iloc[0]
+        sod_nominal = group_df["cumulative_nominal"].iloc[0]
+        eod_nominal = group_df["cumulative_nominal"].iloc[-1]
+        # Nominal entering the day before any first-hour trading.
+        prior_eod_nominal = sod_nominal - group_df["signed_nominal"].iloc[0]
 
-        max_exposure = group_df["cumulative_pos"].abs().max()
-        sod_exposure = abs(sod_pos)
-        prior_eod_exposure = abs(prior_eod_pos)
-        eod_exposure = abs(eod_pos)
+        max_exposure = group_df["cumulative_nominal"].abs().max()
+        sod_exposure = abs(sod_nominal)
+        prior_eod_exposure = abs(prior_eod_nominal)
+        eod_exposure = abs(eod_nominal)
         baseline_eod_exposure = max(sod_exposure, eod_exposure)
         leakage_gap = max_exposure - eod_exposure
         max_to_eod_ratio = max_exposure / (eod_exposure + 1e-9)
@@ -348,6 +431,11 @@ def analyze_intraday_leakage_continuous(
             and (max_exposure > prior_eod_exposure)
         )
 
+        # Nominal volume metrics for the day.
+        total_buy_nominal = group_df["buy_nominal"].sum()
+        total_sell_nominal = group_df["sell_nominal"].sum()
+        total_trade_count = int(group_df["trade_count"].sum())
+
         summary_data.append(
             {
                 "ExecDate": exec_date,
@@ -356,14 +444,17 @@ def analyze_intraday_leakage_continuous(
                 "Maturity": mat,
                 "Currency": ccy,
                 "Bin_Count": bin_count,
-                "Prior_EOD_Position": prior_eod_pos,
-                "SOD_Position": sod_pos,
-                "EOD_Position": eod_pos,
-                "Max_Intraday_Position": max_exposure,
+                "Prior_EOD_Nominal": prior_eod_nominal,
+                "SOD_Nominal": sod_nominal,
+                "EOD_Nominal": eod_nominal,
+                "Max_Intraday_Nominal": max_exposure,
                 "Leakage_Gap": leakage_gap,
                 "Max_to_EOD_Ratio": max_to_eod_ratio,
                 "Max_to_Prior_EOD_Ratio": max_to_prior_eod_ratio,
                 "Max_to_Baseline_EOD_Ratio": max_to_baseline_eod_ratio,
+                "Total_Buy_Nominal": total_buy_nominal,
+                "Total_Sell_Nominal": total_sell_nominal,
+                "Total_Trade_Count": total_trade_count,
                 "Leakage_Detected": is_leakage,
             }
         )
@@ -371,7 +462,7 @@ def analyze_intraday_leakage_continuous(
     results_df = pd.DataFrame(summary_data)
 
     # 6) Plot only the highest-ranked flagged leakage groups.
-    metric_candidates = {"Leakage_Gap", "Max_Intraday_Position", "Max_to_EOD_Ratio", "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio"}
+    metric_candidates = {"Leakage_Gap", "Max_Intraday_Nominal", "Max_to_EOD_Ratio", "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio"}
     if plot_metric not in metric_candidates:
         raise ValueError(
             f"Invalid plot_metric '{plot_metric}'. Use one of: {sorted(metric_candidates)}"
@@ -413,11 +504,11 @@ def analyze_intraday_leakage_continuous(
 
             sod_time = group_df["hour_bucket"].iloc[0]
             eod_time = group_df["hour_bucket"].iloc[-1]
-            sod_pos = group_df["cumulative_pos"].iloc[0]
-            eod_pos = group_df["cumulative_pos"].iloc[-1]
-            max_exposure = group_df["cumulative_pos"].abs().max()
+            sod_nominal = group_df["cumulative_nominal"].iloc[0]
+            eod_nominal = group_df["cumulative_nominal"].iloc[-1]
+            max_exposure = group_df["cumulative_nominal"].abs().max()
 
-            fig, ax = plt.subplots(figsize=(11, 6))
+            fig, ax = plt.subplots(figsize=(13, 7))
 
             hour_bin_starts = group_df["hour_bucket"]
             hour_bin_centers = hour_bin_starts + timedelta(minutes=30)
@@ -425,20 +516,50 @@ def analyze_intraday_leakage_continuous(
             eod_time_center = eod_time + timedelta(minutes=30)
             local_tz_name = _currency_to_timezone(row["Currency"]) or "UTC"
 
+            # Bar width for side-by-side buy/sell nominal bars.
+            bar_width = timedelta(minutes=25)
+
+            # Buy nominal bars (positive, left-aligned within hour).
             ax.bar(
                 hour_bin_starts,
-                group_df["cumulative_pos"],
-                width=timedelta(hours=1),
+                group_df["buy_nominal"],
+                width=bar_width,
                 align="edge",
-                alpha=0.85,
-                edgecolor="#1f1f1f",
-                linewidth=0.6,
-                label="Hourly Cumulative Position",
+                alpha=0.65,
+                color="#2ca02c",
+                edgecolor="#1a6e1a",
+                linewidth=0.5,
+                label="Buy Nominal (EUR)",
             )
 
+            # Sell nominal bars (shown as negative, offset to right half).
+            ax.bar(
+                hour_bin_starts + timedelta(minutes=25),
+                -group_df["sell_nominal"],
+                width=bar_width,
+                align="edge",
+                alpha=0.65,
+                color="#d62728",
+                edgecolor="#8b1a1a",
+                linewidth=0.5,
+                label="Sell Nominal (EUR)",
+            )
+
+            # Cumulative nominal position line.
+            ax.plot(
+                hour_bin_centers,
+                group_df["cumulative_nominal"],
+                color="#1f77b4",
+                linewidth=2,
+                marker="s",
+                markersize=4,
+                label="Cumulative Nominal",
+            )
+
+            # SOD → EOD position line (kept from original).
             ax.plot(
                 [sod_time_center, eod_time_center],
-                [sod_pos, eod_pos],
+                [sod_nominal, eod_nominal],
                 color="red",
                 linestyle="--",
                 linewidth=3,
@@ -446,10 +567,29 @@ def analyze_intraday_leakage_continuous(
                 label="Net Flow (SOD to EOD)",
             )
 
+            ax.set_ylabel("Nominal (EUR)", color="black")
+            ax.axhline(0, color="black", linewidth=0.5)
+
+            # Secondary y-axis for trade count.
+            ax2 = ax.twinx()
+            ax2.bar(
+                hour_bin_starts + timedelta(minutes=10),
+                group_df["trade_count"],
+                width=timedelta(minutes=30),
+                align="edge",
+                alpha=0.25,
+                color="#ff7f0e",
+                edgecolor="#cc6600",
+                linewidth=0.5,
+                label="Trade Count",
+            )
+            ax2.set_ylabel("Trade Count", color="#ff7f0e")
+            ax2.tick_params(axis="y", labelcolor="#ff7f0e")
+
             ax.set_title(
-                f"Intraday Risk Leakage\n"
+                f"Intraday Risk Leakage (Nominal)\n"
                 f"{row['Underlying']} ({row['Currency']}) | {row['Portfolio']} | {row['ExecDate']}\n"
-                f"Peak: {max_exposure:,.0f} | EOD: {eod_pos:,.0f} | {plot_metric}: {row[plot_metric]:,.2f}",
+                f"Peak: {max_exposure:,.0f} EUR | EOD: {eod_nominal:,.0f} EUR | {plot_metric}: {row[plot_metric]:,.2f}",
                 fontsize=11,
             )
 
@@ -458,11 +598,13 @@ def analyze_intraday_leakage_continuous(
             ax.set_xlim(x_start, x_end)
             ax.xaxis.set_major_locator(mdates.HourLocator(interval=1))
             ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-            ax.axhline(0, color="black", linewidth=0.5)
             ax.set_xlabel(f"Hour ({local_tz_name})")
-            ax.set_ylabel("Position")
             ax.tick_params(axis="x", labelrotation=45)
-            ax.legend()
+
+            # Combine legends from both axes.
+            lines_1, labels_1 = ax.get_legend_handles_labels()
+            lines_2, labels_2 = ax2.get_legend_handles_labels()
+            ax.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper left", fontsize=8)
             ax.grid(axis="y", linestyle=":", alpha=0.5)
 
             safe_name = (
@@ -470,6 +612,7 @@ def analyze_intraday_leakage_continuous(
                     ":", ""
                 ).replace("/", "-")
             )
+            plt.tight_layout()
             plt.savefig(os.path.join(output_folder, f"Leakage_{safe_name}.png"))
             plt.close()
             plotted_count += 1
@@ -477,10 +620,7 @@ def analyze_intraday_leakage_continuous(
     # 7) Map flagged leakage cases back to the original trade-level DataFrame.
     leakage_summary = results_df[results_df["Leakage_Detected"]].copy()
 
-    # Enrich the working df with execDate (already has execTime_parsed & signed_qty).
-    df["execDate"] = df["execTime_parsed"].apply(
-        lambda ts: ts.date() if ts is not None else None
-    )
+    # Enrich the working df with execDate (already computed above).
 
     # Filter original trades that belong to a flagged group via fast merge.
     leakage_flag_keys = leakage_summary.rename(
@@ -506,8 +646,10 @@ def analyze_intraday_leakage_continuous(
             "Currency": "underlyingCurrency",
         }
     )[["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency",
-       "Prior_EOD_Position", "SOD_Position", "EOD_Position",
-         "Max_Intraday_Position", "Leakage_Gap", "Max_to_EOD_Ratio", "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio"]]
+       "Prior_EOD_Nominal", "SOD_Nominal", "EOD_Nominal",
+         "Max_Intraday_Nominal", "Leakage_Gap", "Max_to_EOD_Ratio",
+         "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio",
+         "Total_Buy_Nominal", "Total_Sell_Nominal", "Total_Trade_Count"]]
 
     flagged_trades_df = flagged_trades_df.merge(
         leakage_merge,
@@ -548,5 +690,9 @@ def analyze_intraday_leakage_continuous(
 if __name__ == "__main__":
     df_trades = pd.read_csv("output/synthetic_trading_data.csv")
     results, flagged = analyze_intraday_leakage_continuous(
-        df_trades, plot_top_pct=5, plot_metric="Max_to_Baseline_EOD_Ratio", max_plots=20
+        df_trades,
+        currency_rates_path="output/currency_rates.xlsx",
+        plot_top_pct=5,
+        plot_metric="Max_to_Baseline_EOD_Ratio",
+        max_plots=20,
     )
