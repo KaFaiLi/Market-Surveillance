@@ -254,6 +254,7 @@ def analyze_intraday_leakage_continuous(
     plot_top_pct=5,
     plot_metric="Leakage_Gap",
     max_plots=None,
+    plot_exposure_threshold=None,
     debug_sorting=False,
     expected_start_hour=9,
 ):
@@ -275,6 +276,9 @@ def analyze_intraday_leakage_continuous(
         `Max_to_Prior_EOD_Ratio`, `Max_to_Baseline_EOD_Ratio`,
         `Baseline_Deviation_Ratio`.
     max_plots: Optional hard cap on the number of plots to generate.
+    plot_exposure_threshold: Optional minimum Max_Intraday_Nominal (EUR)
+        required for a leakage group to be plotted. Groups below this
+        threshold are skipped. Example: 10_000_000 (10 million EUR).
 
     Returns:
     Tuple[pd.DataFrame, pd.DataFrame]:
@@ -475,6 +479,11 @@ def analyze_intraday_leakage_continuous(
     plotted_count = 0
 
     if not leakage_df.empty and plot_top_pct > 0:
+        # Apply exposure threshold filter before ranking.
+        if plot_exposure_threshold is not None:
+            leakage_df = leakage_df[
+                leakage_df["Max_Intraday_Nominal"] >= plot_exposure_threshold
+            ]
         leakage_df = leakage_df.sort_values(plot_metric, ascending=False)
         top_n = max(1, int(np.ceil(len(leakage_df) * (plot_top_pct / 100.0))))
         if max_plots is not None:
@@ -728,4 +737,5 @@ if __name__ == "__main__":
         plot_top_pct=5,
         plot_metric="Max_to_Baseline_EOD_Ratio",
         max_plots=20,
+        plot_exposure_threshold=10_000_000,
     )
