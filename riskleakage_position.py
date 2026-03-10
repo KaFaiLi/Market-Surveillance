@@ -122,9 +122,7 @@ def _write_audit_report(
             "Max_to_EOD_Ratio",
             "Max_to_Prior_EOD_Ratio",
             "Max_to_Baseline_EOD_Ratio",
-            "Total_Buy_Nominal",
-            "Total_Sell_Nominal",
-            "Total_Trade_Count",
+            "Baseline_Deviation_Ratio",
         ]
         t2 = PrettyTable()
         t2.field_names = ["Metric", "Min", "Max", "Mean", "Median"]
@@ -153,9 +151,11 @@ def _write_audit_report(
         t3 = PrettyTable()
         t3.field_names = [
             "#", "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
-            "Pre-Market", "SOD_Nom", "EOD_Nom", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio",
+            "Pre-Market", "SOD_Nom", "EOD_Nom", "Max_Intraday", "Leakage_Gap",
+            "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio", "Baseline Dev Ratio",
         ]
-        for col in ["Pre-Market", "SOD_Nom", "EOD_Nom", "Max_Intraday", "Leakage_Gap", "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio"]:
+        for col in ["Pre-Market", "SOD_Nom", "EOD_Nom", "Max_Intraday", "Leakage_Gap",
+                     "Max/EOD Ratio", "Max/PriorEOD Ratio", "Max/BaselineEOD Ratio", "Baseline Dev Ratio"]:
             t3.align[col] = "r"
         for i, row in sorted_leakage.iterrows():
             t3.add_row([
@@ -173,6 +173,7 @@ def _write_audit_report(
                 f"{row['Max_to_EOD_Ratio']:>10,.4f}",
                 f"{row['Max_to_Prior_EOD_Ratio']:>15,.4f}",
                 f"{row['Max_to_Baseline_EOD_Ratio']:>18,.4f}",
+                f"{row['Baseline_Deviation_Ratio']:>15,.4f}",
             ])
         w(t3)
 
@@ -271,7 +272,8 @@ def analyze_intraday_leakage_continuous(
     plot_top_pct: Percent (0-100) of flagged leakage groups to plot.
     plot_metric: Ranking metric for plot selection. One of
         `Leakage_Gap`, `Max_Intraday_Nominal`, `Max_to_EOD_Ratio`,
-        `Max_to_Prior_EOD_Ratio`, `Max_to_Baseline_EOD_Ratio`.
+        `Max_to_Prior_EOD_Ratio`, `Max_to_Baseline_EOD_Ratio`,
+        `Baseline_Deviation_Ratio`.
     max_plots: Optional hard cap on the number of plots to generate.
 
     Returns:
@@ -433,10 +435,11 @@ def analyze_intraday_leakage_continuous(
             and (max_exposure > prior_eod_exposure)
         )
 
-        # Nominal volume metrics for the day.
-        total_buy_nominal = group_df["buy_nominal"].sum()
-        total_sell_nominal = group_df["sell_nominal"].sum()
-        total_trade_count = int(group_df["trade_count"].sum())
+        # Raw max nominal (without abs) for the baseline deviation metric.
+        max_nominal_raw = group_df["cumulative_nominal"].max()
+        baseline_deviation_ratio = (
+            (baseline_eod_exposure - max_nominal_raw) / (baseline_eod_exposure + 1e-9)
+        )
 
         summary_data.append(
             {
@@ -454,9 +457,7 @@ def analyze_intraday_leakage_continuous(
                 "Max_to_EOD_Ratio": max_to_eod_ratio,
                 "Max_to_Prior_EOD_Ratio": max_to_prior_eod_ratio,
                 "Max_to_Baseline_EOD_Ratio": max_to_baseline_eod_ratio,
-                "Total_Buy_Nominal": total_buy_nominal,
-                "Total_Sell_Nominal": total_sell_nominal,
-                "Total_Trade_Count": total_trade_count,
+                "Baseline_Deviation_Ratio": baseline_deviation_ratio,
                 "Leakage_Detected": is_leakage,
             }
         )
@@ -464,7 +465,7 @@ def analyze_intraday_leakage_continuous(
     results_df = pd.DataFrame(summary_data)
 
     # 6) Plot only the highest-ranked flagged leakage groups.
-    metric_candidates = {"Leakage_Gap", "Max_Intraday_Nominal", "Max_to_EOD_Ratio", "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio"}
+    metric_candidates = {"Leakage_Gap", "Max_Intraday_Nominal", "Max_to_EOD_Ratio", "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio", "Baseline_Deviation_Ratio"}
     if plot_metric not in metric_candidates:
         raise ValueError(
             f"Invalid plot_metric '{plot_metric}'. Use one of: {sorted(metric_candidates)}"
@@ -655,7 +656,7 @@ def analyze_intraday_leakage_continuous(
         "Prior_EOD_Nominal", "SOD_Nominal", "EOD_Nominal",
         "Max_Intraday_Nominal", "Leakage_Gap", "Max_to_EOD_Ratio",
         "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio",
-        "Total_Buy_Nominal", "Total_Sell_Nominal", "Total_Trade_Count",
+        "Baseline_Deviation_Ratio",
     ]]
 
     flagged_trades_df = flagged_trades_df.merge(
