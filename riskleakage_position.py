@@ -340,7 +340,9 @@ def analyze_intraday_leakage_continuous(
         errors="coerce",
     ).fillna(1.0)
 
-    # Nominal = premium_EUR × quantity × futurePointValue
+    # Nominal = premium_EUR × quantity × futurePointValue.
+    # Use abs(premium_eur) so the sign is solely determined by buy/sell way,
+    # since premiums can be negative in some source data.
     df["nominal"] = (
         df["premium_eur"].abs() * df["quantity"] * df["futurePointValue_numeric"]
     )
@@ -516,14 +518,17 @@ def analyze_intraday_leakage_continuous(
             eod_time_center = eod_time + timedelta(minutes=30)
             local_tz_name = _currency_to_timezone(row["Currency"]) or "UTC"
 
-            # Bar width for side-by-side buy/sell nominal bars.
-            bar_width = timedelta(minutes=25)
+            # Layout constants for side-by-side bars within each hour bin.
+            nom_bar_width = timedelta(minutes=25)
+            sell_bar_offset = timedelta(minutes=25)
+            count_bar_offset = timedelta(minutes=10)
+            count_bar_width = timedelta(minutes=30)
 
             # Buy nominal bars (positive, left-aligned within hour).
             ax.bar(
                 hour_bin_starts,
                 group_df["buy_nominal"],
-                width=bar_width,
+                width=nom_bar_width,
                 align="edge",
                 alpha=0.65,
                 color="#2ca02c",
@@ -534,9 +539,9 @@ def analyze_intraday_leakage_continuous(
 
             # Sell nominal bars (shown as negative, offset to right half).
             ax.bar(
-                hour_bin_starts + timedelta(minutes=25),
+                hour_bin_starts + sell_bar_offset,
                 -group_df["sell_nominal"],
-                width=bar_width,
+                width=nom_bar_width,
                 align="edge",
                 alpha=0.65,
                 color="#d62728",
@@ -573,9 +578,9 @@ def analyze_intraday_leakage_continuous(
             # Secondary y-axis for trade count.
             ax2 = ax.twinx()
             ax2.bar(
-                hour_bin_starts + timedelta(minutes=10),
+                hour_bin_starts + count_bar_offset,
                 group_df["trade_count"],
-                width=timedelta(minutes=30),
+                width=count_bar_width,
                 align="edge",
                 alpha=0.25,
                 color="#ff7f0e",
@@ -645,11 +650,13 @@ def analyze_intraday_leakage_continuous(
             "Maturity": "maturity",
             "Currency": "underlyingCurrency",
         }
-    )[["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency",
-       "Prior_EOD_Nominal", "SOD_Nominal", "EOD_Nominal",
-         "Max_Intraday_Nominal", "Leakage_Gap", "Max_to_EOD_Ratio",
-         "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio",
-         "Total_Buy_Nominal", "Total_Sell_Nominal", "Total_Trade_Count"]]
+    )[[
+        "execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency",
+        "Prior_EOD_Nominal", "SOD_Nominal", "EOD_Nominal",
+        "Max_Intraday_Nominal", "Leakage_Gap", "Max_to_EOD_Ratio",
+        "Max_to_Prior_EOD_Ratio", "Max_to_Baseline_EOD_Ratio",
+        "Total_Buy_Nominal", "Total_Sell_Nominal", "Total_Trade_Count",
+    ]]
 
     flagged_trades_df = flagged_trades_df.merge(
         leakage_merge,
