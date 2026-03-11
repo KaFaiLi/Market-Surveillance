@@ -303,6 +303,7 @@ def analyze_intraday_leakage_continuous(
     plot_top_pct=5,
     plot_metric="Delta_Leakage_Gap",
     max_plots=None,
+    plot_exposure_threshold=None,
     debug_sorting=False,
     expected_start_hour=9,
 ):
@@ -333,6 +334,9 @@ def analyze_intraday_leakage_continuous(
     plot_top_pct : float  (0–100)
     plot_metric : str
     max_plots : int or None
+    plot_exposure_threshold : float or None
+        Minimum Max_Intraday_Delta (EUR) required for a leakage group
+        to be plotted.  Groups below this threshold are skipped.
     debug_sorting : bool
     expected_start_hour : int
 
@@ -413,6 +417,17 @@ def analyze_intraday_leakage_continuous(
         df["way"].str.upper() == "BUY", df["quantity"], -df["quantity"]
     )
 
+    # Buy / sell nominal (sign-aware, for per-type bar charts).
+    df["nominal"] = (
+        df["premium_eur"].abs() * df["quantity"] * df["futurePointValue_numeric"]
+    )
+    df["buy_nominal"] = np.where(
+        df["way"].str.upper() == "BUY", df["nominal"], 0.0
+    )
+    df["sell_nominal"] = np.where(
+        df["way"].str.upper() == "SELL", df["nominal"], 0.0
+    )
+
     # ── 4. Hourly aggregation per product ──────────────────────────────
     #   FUT product key = (portfolioId, underlyingId, maturity, underlyingCurrency)
     #   SHA product key = (portfolioId, underlyingId, underlyingCurrency)
@@ -476,6 +491,9 @@ def analyze_intraday_leakage_continuous(
             df_fut.groupby(fut_keys + ["hour_bucket"])
             .agg(
                 signed_qty=("signed_qty", "sum"),
+                buy_nominal=("buy_nominal", "sum"),
+                sell_nominal=("sell_nominal", "sum"),
+                trade_count=("signed_qty", "count"),
                 latest_price=("premium_numeric", "last"),
                 latest_fpv=("futurePointValue_numeric", "last"),
                 rate_to_eur=("rate_to_eur", "first"),
@@ -551,6 +569,9 @@ def analyze_intraday_leakage_continuous(
             df_sha.groupby(sha_keys + ["hour_bucket"])
             .agg(
                 signed_qty=("signed_qty", "sum"),
+                buy_nominal=("buy_nominal", "sum"),
+                sell_nominal=("sell_nominal", "sum"),
+                trade_count=("signed_qty", "count"),
                 latest_price=("premium_numeric", "last"),
                 rate_to_eur=("rate_to_eur", "first"),
                 initial_pos=("initial_pos", "first"),
@@ -620,15 +641,25 @@ def analyze_intraday_leakage_continuous(
         # Reindex each product's delta & qty onto the full hour grid.
         fut_delta_cols = []
         fut_qty_cols = []
+        fut_buy_nom_cols = []
+        fut_sell_nom_cols = []
+        fut_count_cols = []
         fut_prior_eod_deltas = []
 
         if not fut_pdf.empty:
             for _, udf in fut_pdf.groupby(["underlyingId", "maturity", "underlyingCurrency"]):
                 udf = udf.sort_values("hour_bucket")
-                delta_s = udf.set_index("hour_bucket")["delta_nominal"].reindex(all_hours).ffill().fillna(0)
-                qty_s = udf.set_index("hour_bucket")["signed_qty"].reindex(all_hours).fillna(0)
+                idx = udf.set_index("hour_bucket")
+                delta_s = idx["delta_nominal"].reindex(all_hours).ffill().fillna(0)
+                qty_s = idx["signed_qty"].reindex(all_hours).fillna(0)
+                buy_s = idx["buy_nominal"].reindex(all_hours).fillna(0)
+                sell_s = idx["sell_nominal"].reindex(all_hours).fillna(0)
+                cnt_s = idx["trade_count"].reindex(all_hours).fillna(0)
                 fut_delta_cols.append(delta_s)
                 fut_qty_cols.append(qty_s)
+                fut_buy_nom_cols.append(buy_s)
+                fut_sell_nom_cols.append(sell_s)
+                fut_count_cols.append(cnt_s)
                 # Prior-EOD delta for this FUT product.
                 first_row = udf.iloc[0]
                 prior_pos = first_row["cumulative_pos"] - first_row["signed_qty"]
@@ -637,15 +668,25 @@ def analyze_intraday_leakage_continuous(
 
         sha_delta_cols = []
         sha_qty_cols = []
+        sha_buy_nom_cols = []
+        sha_sell_nom_cols = []
+        sha_count_cols = []
         sha_prior_eod_deltas = []
 
         if not sha_pdf.empty:
             for _, udf in sha_pdf.groupby(["underlyingId", "underlyingCurrency"]):
                 udf = udf.sort_values("hour_bucket")
-                delta_s = udf.set_index("hour_bucket")["delta_nominal"].reindex(all_hours).ffill().fillna(0)
-                qty_s = udf.set_index("hour_bucket")["signed_qty"].reindex(all_hours).fillna(0)
+                idx = udf.set_index("hour_bucket")
+                delta_s = idx["delta_nominal"].reindex(all_hours).ffill().fillna(0)
+                qty_s = idx["signed_qty"].reindex(all_hours).fillna(0)
+                buy_s = idx["buy_nominal"].reindex(all_hours).fillna(0)
+                sell_s = idx["sell_nominal"].reindex(all_hours).fillna(0)
+                cnt_s = idx["trade_count"].reindex(all_hours).fillna(0)
                 sha_delta_cols.append(delta_s)
                 sha_qty_cols.append(qty_s)
+                sha_buy_nom_cols.append(buy_s)
+                sha_sell_nom_cols.append(sell_s)
+                sha_count_cols.append(cnt_s)
                 first_row = udf.iloc[0]
                 prior_pos = first_row["cumulative_pos"] - first_row["signed_qty"]
                 prior_delta = prior_pos * first_row["latest_price_eur"]
@@ -672,6 +713,37 @@ def analyze_intraday_leakage_continuous(
             if sha_qty_cols
             else pd.Series(0.0, index=all_hours)
         )
+        # Buy / sell / count per deal type.
+        total_buy_fut = (
+            pd.concat(fut_buy_nom_cols, axis=1).sum(axis=1)
+            if fut_buy_nom_cols
+            else pd.Series(0.0, index=all_hours)
+        )
+        total_sell_fut = (
+            pd.concat(fut_sell_nom_cols, axis=1).sum(axis=1)
+            if fut_sell_nom_cols
+            else pd.Series(0.0, index=all_hours)
+        )
+        total_count_fut = (
+            pd.concat(fut_count_cols, axis=1).sum(axis=1)
+            if fut_count_cols
+            else pd.Series(0, index=all_hours)
+        )
+        total_buy_sha = (
+            pd.concat(sha_buy_nom_cols, axis=1).sum(axis=1)
+            if sha_buy_nom_cols
+            else pd.Series(0.0, index=all_hours)
+        )
+        total_sell_sha = (
+            pd.concat(sha_sell_nom_cols, axis=1).sum(axis=1)
+            if sha_sell_nom_cols
+            else pd.Series(0.0, index=all_hours)
+        )
+        total_count_sha = (
+            pd.concat(sha_count_cols, axis=1).sum(axis=1)
+            if sha_count_cols
+            else pd.Series(0, index=all_hours)
+        )
         portfolio_delta = total_delta_fut + total_delta_sha
 
         pf_df = pd.DataFrame({
@@ -680,6 +752,12 @@ def analyze_intraday_leakage_continuous(
             "delta_sha": total_delta_sha.values,
             "qty_fut": total_qty_fut.values,
             "qty_sha": total_qty_sha.values,
+            "buy_nom_fut": total_buy_fut.values,
+            "sell_nom_fut": total_sell_fut.values,
+            "count_fut": total_count_fut.values.astype(int),
+            "buy_nom_sha": total_buy_sha.values,
+            "sell_nom_sha": total_sell_sha.values,
+            "count_sha": total_count_sha.values.astype(int),
             "portfolio_delta": portfolio_delta.values,
         }).sort_values("hour_bucket").reset_index(drop=True)
 
@@ -747,6 +825,11 @@ def analyze_intraday_leakage_continuous(
     plotted_count = 0
 
     if not pf_leakage_df.empty and plot_top_pct > 0:
+        # Apply exposure threshold filter before ranking.
+        if plot_exposure_threshold is not None:
+            pf_leakage_df = pf_leakage_df[
+                pf_leakage_df["Max_Intraday_Delta"] >= plot_exposure_threshold
+            ]
         pf_leakage_df = pf_leakage_df.sort_values(plot_metric, ascending=False)
         top_n = max(1, int(np.ceil(len(pf_leakage_df) * (plot_top_pct / 100.0))))
         if max_plots is not None:
@@ -760,101 +843,194 @@ def analyze_intraday_leakage_continuous(
                 continue
 
             pf_df = pf_df.sort_values("hour_bucket").reset_index(drop=True)
-            h_starts = pf_df["hour_bucket"]
+
+            # Build a complete hourly range (fill hours with no trades).
+            sod_time = pf_df["hour_bucket"].iloc[0]
+            eod_time = pf_df["hour_bucket"].iloc[-1]
+            all_plot_hours = pd.date_range(start=sod_time, end=eod_time, freq="h")
+            full_df = (
+                pd.DataFrame({"hour_bucket": all_plot_hours})
+                .merge(pf_df, on="hour_bucket", how="left")
+            )
+            for _col in ["buy_nom_fut", "sell_nom_fut", "buy_nom_sha", "sell_nom_sha",
+                         "qty_fut", "qty_sha"]:
+                full_df[_col] = full_df[_col].fillna(0.0)
+            for _col in ["count_fut", "count_sha"]:
+                full_df[_col] = full_df[_col].fillna(0).astype(int)
+            # Forward-fill cumulative delta columns then back-fill leading gaps.
+            for _col in ["delta_fut", "delta_sha", "portfolio_delta"]:
+                full_df[_col] = full_df[_col].ffill().bfill().fillna(0.0)
+
+            h_starts = full_df["hour_bucket"]
             h_centers = h_starts + timedelta(minutes=30)
-            h_centers_num = mdates.date2num(h_centers)
-            bar_width = (1.0 / 24.0) * 0.35
 
-            pf_peak = pf_df["portfolio_delta"].abs().max()
-            pf_eod = pf_df["portfolio_delta"].iloc[-1]
+            pf_peak = full_df["portfolio_delta"].abs().max()
+            pf_eod = full_df["portfolio_delta"].iloc[-1]
+            pf_sod = full_df["portfolio_delta"].iloc[0]
+            sod_center = sod_time + timedelta(minutes=30)
+            eod_center = eod_time + timedelta(minutes=30)
 
-            fig, (ax_sha, ax_fut, ax_delta) = plt.subplots(
+            bar_width = timedelta(minutes=50)
+            nom_bar_width = timedelta(minutes=25)
+            sell_bar_offset = timedelta(minutes=25)
+
+            fig, (ax_delta, ax_fut, ax_sha) = plt.subplots(
                 3, 1,
-                figsize=(14, 10),
+                figsize=(14, 12),
                 sharex=True,
-                gridspec_kw={"height_ratios": [1, 1, 2]},
+                gridspec_kw={"height_ratios": [1.4, 1, 1]},
             )
 
-            # ── Panel 1: SHA quantity (independent scale – millions) ───
-            ax_sha.bar(
-                h_centers_num,
-                pf_df["qty_sha"],
-                width=bar_width * 2,
-                align="center",
-                alpha=0.70,
-                edgecolor="#1f1f1f",
-                linewidth=0.6,
-                color="#1f77b4",
-                label="Share Qty (SHA)",
+            # ── Chart 1: Cumulative Delta (bars) + SOD→EOD line ────────
+            ax_delta.bar(
+                h_starts,
+                full_df["portfolio_delta"],
+                width=bar_width,
+                align="edge",
+                alpha=0.55,
+                color="#d62728",
+                edgecolor="#8b1a1a",
+                linewidth=0.5,
+                label="Portfolio Delta (EUR)",
             )
-            ax_sha.set_ylabel("SHA\nNet Qty (shares)", color="#1f77b4", fontsize=9)
-            ax_sha.tick_params(axis="y", labelcolor="#1f77b4")
-            ax_sha.axhline(0, color="black", linewidth=0.5)
-            ax_sha.legend(loc="upper left", fontsize=8)
-            ax_sha.grid(axis="y", linestyle=":", alpha=0.5)
-            ax_sha.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
-            )
-
-            # ── Panel 2: FUT quantity (independent scale – contracts) ──
-            ax_fut.bar(
-                h_centers_num,
-                pf_df["qty_fut"],
-                width=bar_width * 2,
-                align="center",
-                alpha=0.70,
-                edgecolor="#1f1f1f",
-                linewidth=0.6,
-                color="#ff7f0e",
-                label="Future Qty (FUT)",
-            )
-            ax_fut.set_ylabel("FUT\nNet Qty (contracts)", color="#ff7f0e", fontsize=9)
-            ax_fut.tick_params(axis="y", labelcolor="#ff7f0e")
-            ax_fut.axhline(0, color="black", linewidth=0.5)
-            ax_fut.legend(loc="upper left", fontsize=8)
-            ax_fut.grid(axis="y", linestyle=":", alpha=0.5)
-            ax_fut.yaxis.set_major_formatter(
-                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
-            )
-
-            # ── Panel 3: Delta nominal lines ───────────────────────────
+            # Overlay SHA and FUT delta as lines for decomposition.
             ax_delta.plot(
                 h_centers,
-                pf_df["delta_sha"],
+                full_df["delta_sha"],
                 color="#1f77b4",
-                linewidth=1.8,
+                linewidth=1.5,
                 marker="v",
                 markersize=3,
                 label="SHA Delta (EUR)",
             )
             ax_delta.plot(
                 h_centers,
-                pf_df["delta_fut"],
+                full_df["delta_fut"],
                 color="#ff7f0e",
-                linewidth=1.8,
+                linewidth=1.5,
                 marker="^",
                 markersize=3,
                 label="FUT Delta (EUR)",
             )
+            # SOD → EOD net flow line.
             ax_delta.plot(
-                h_centers,
-                pf_df["portfolio_delta"],
-                color="#d62728",
-                linewidth=2.5,
-                marker="s",
-                markersize=4,
-                label="Portfolio Delta (EUR)",
+                [sod_center, eod_center],
+                [pf_sod, pf_eod],
+                color="black",
+                linestyle="--",
+                linewidth=3,
+                marker="o",
+                markersize=6,
+                label="Net Flow (SOD to EOD)",
             )
-            ax_delta.set_ylabel("Delta Nominal (EUR)", color="#333333", fontsize=9)
-            ax_delta.tick_params(axis="y", labelcolor="#333333")
+            ax_delta.set_ylabel("Delta Nominal (EUR)", fontsize=9)
             ax_delta.axhline(0, color="black", linewidth=0.5)
             ax_delta.legend(loc="upper left", fontsize=8)
             ax_delta.grid(axis="y", linestyle=":", alpha=0.5)
             ax_delta.yaxis.set_major_formatter(
                 plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
             )
-            ax_delta.set_xlabel("Hour (local)")
-            ax_delta.tick_params(axis="x", labelrotation=45)
+            ax_delta.set_title(
+                f"Portfolio Delta Nominal Exposure – Intraday Path\n"
+                f"{prow['Portfolio']} | {prow['ExecDate']}\n"
+                f"Peak: {pf_peak:,.0f} EUR | EOD: {pf_eod:,.0f} EUR | "
+                f"{plot_metric}: {prow[plot_metric]:,.2f}",
+                fontsize=10,
+            )
+
+            # ── Chart 2: FUT Buy/Sell Nominal (bars) + Trade Count (line)
+            ax_fut.bar(
+                h_starts,
+                full_df["buy_nom_fut"],
+                width=nom_bar_width,
+                align="edge",
+                alpha=0.65,
+                color="#2ca02c",
+                edgecolor="#1a6e1a",
+                linewidth=0.5,
+                label="FUT Buy Nominal (EUR)",
+            )
+            ax_fut.bar(
+                h_starts + sell_bar_offset,
+                -full_df["sell_nom_fut"],
+                width=nom_bar_width,
+                align="edge",
+                alpha=0.65,
+                color="#d62728",
+                edgecolor="#8b1a1a",
+                linewidth=0.5,
+                label="FUT Sell Nominal (EUR)",
+            )
+            ax_fut.set_ylabel("FUT Nominal (EUR)", fontsize=9)
+            ax_fut.axhline(0, color="black", linewidth=0.5)
+            ax_fut.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
+            )
+            # Trade count as line on secondary axis.
+            ax_fut2 = ax_fut.twinx()
+            ax_fut2.plot(
+                h_centers,
+                full_df["count_fut"],
+                color="#ff7f0e",
+                linewidth=1.5,
+                marker="o",
+                markersize=3,
+                label="FUT Trade Count",
+            )
+            ax_fut2.set_ylabel("Trade Count", color="#ff7f0e", fontsize=9)
+            ax_fut2.tick_params(axis="y", labelcolor="#ff7f0e")
+            lines_f1, labels_f1 = ax_fut.get_legend_handles_labels()
+            lines_f2, labels_f2 = ax_fut2.get_legend_handles_labels()
+            ax_fut.legend(lines_f1 + lines_f2, labels_f1 + labels_f2, loc="upper left", fontsize=8)
+            ax_fut.grid(axis="y", linestyle=":", alpha=0.5)
+            ax_fut.set_title("Futures – Buy / Sell Nominal & Trade Count", fontsize=10)
+
+            # ── Chart 3: SHA Buy/Sell Nominal (bars) + Trade Count (line)
+            ax_sha.bar(
+                h_starts,
+                full_df["buy_nom_sha"],
+                width=nom_bar_width,
+                align="edge",
+                alpha=0.65,
+                color="#2ca02c",
+                edgecolor="#1a6e1a",
+                linewidth=0.5,
+                label="SHA Buy Nominal (EUR)",
+            )
+            ax_sha.bar(
+                h_starts + sell_bar_offset,
+                -full_df["sell_nom_sha"],
+                width=nom_bar_width,
+                align="edge",
+                alpha=0.65,
+                color="#d62728",
+                edgecolor="#8b1a1a",
+                linewidth=0.5,
+                label="SHA Sell Nominal (EUR)",
+            )
+            ax_sha.set_ylabel("SHA Nominal (EUR)", fontsize=9)
+            ax_sha.axhline(0, color="black", linewidth=0.5)
+            ax_sha.yaxis.set_major_formatter(
+                plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
+            )
+            # Trade count as line on secondary axis.
+            ax_sha2 = ax_sha.twinx()
+            ax_sha2.plot(
+                h_centers,
+                full_df["count_sha"],
+                color="#1f77b4",
+                linewidth=1.5,
+                marker="o",
+                markersize=3,
+                label="SHA Trade Count",
+            )
+            ax_sha2.set_ylabel("Trade Count", color="#1f77b4", fontsize=9)
+            ax_sha2.tick_params(axis="y", labelcolor="#1f77b4")
+            lines_s1, labels_s1 = ax_sha.get_legend_handles_labels()
+            lines_s2, labels_s2 = ax_sha2.get_legend_handles_labels()
+            ax_sha.legend(lines_s1 + lines_s2, labels_s1 + labels_s2, loc="upper left", fontsize=8)
+            ax_sha.grid(axis="y", linestyle=":", alpha=0.5)
+            ax_sha.set_title("Shares – Buy / Sell Nominal & Trade Count", fontsize=10)
 
             # ── Shared X-axis formatting ───────────────────────────────
             x_start = h_starts.iloc[0]
@@ -862,14 +1038,8 @@ def analyze_intraday_leakage_continuous(
             ax_sha.set_xlim(x_start, x_end)
             ax_sha.xaxis.set_major_locator(mdates.HourLocator(interval=1))
             ax_sha.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-
-            fig.suptitle(
-                f"Portfolio Delta Nominal Exposure – Intraday Path\n"
-                f"{prow['Portfolio']} | {prow['ExecDate']}\n"
-                f"Peak: {pf_peak:,.0f} EUR | EOD: {pf_eod:,.0f} EUR | "
-                f"{plot_metric}: {prow[plot_metric]:,.2f}",
-                fontsize=10,
-            )
+            ax_sha.set_xlabel("Hour (local)")
+            ax_sha.tick_params(axis="x", labelrotation=45)
 
             safe_name = (
                 f"{prow['ExecDate']}_{prow['Portfolio']}"
@@ -943,4 +1113,5 @@ if __name__ == "__main__":
         plot_top_pct=5,
         plot_metric="Delta_Max_to_Baseline_Ratio",
         max_plots=20,
+        plot_exposure_threshold=10_000_000,
     )
