@@ -55,6 +55,7 @@ def _write_audit_report(
     results_df: pd.DataFrame,
     flagged_trades_df: pd.DataFrame,
     report_path: str,
+    hourly_flagged_df: pd.DataFrame | None = None,
 ) -> None:
     """Write a formatted auditor-ready report to *report_path* (plain text).
 
@@ -64,6 +65,7 @@ def _write_audit_report(
     2. Leakage Metric Statistics – min/max/mean/median for key risk measures.
     3. Flagged Cases Detail – one row per leakage group, sorted by Leakage_Gap.
     4. Flagged Trades Summary – trade count and gross signed qty per leakage group.
+    5. Hourly Buy/Sell Nominal – hourly sum of buy and sell nominal per flagged group.
     """
     leakage_df = results_df[results_df["Leakage_Detected"]].copy()
     total_groups = len(results_df)
@@ -218,6 +220,36 @@ def _write_audit_report(
                 ])
             w(t4)
 
+        # ------------------------------------------------------------------
+        # Section 5: Hourly Buy/Sell Nominal per Flagged Group
+        # ------------------------------------------------------------------
+        if hourly_flagged_df is not None and not hourly_flagged_df.empty:
+            w(f"\n{sep}")
+            w("  HOURLY BUY / SELL NOMINAL  (flagged leakage groups)")
+            w(sep)
+
+            t5 = PrettyTable()
+            t5.field_names = [
+                "ExecDate", "Portfolio", "Underlying", "Maturity", "Currency",
+                "Hour_Bucket", "Sum_Buy_Nominal", "Sum_Sell_Nominal", "Net_Nominal", "Trade_Count",
+            ]
+            for col in ["Sum_Buy_Nominal", "Sum_Sell_Nominal", "Net_Nominal", "Trade_Count"]:
+                t5.align[col] = "r"
+            for _, row in hourly_flagged_df.iterrows():
+                t5.add_row([
+                    row["ExecDate"],
+                    row["Portfolio"],
+                    row["Underlying"],
+                    row["Maturity"],
+                    row["Currency"],
+                    str(row["Hour_Bucket"]),
+                    f"{row['Sum_Buy_Nominal']:>14,.0f}",
+                    f"{row['Sum_Sell_Nominal']:>14,.0f}",
+                    f"{row['Net_Nominal']:>14,.0f}",
+                    f"{int(row['Trade_Count']):,}",
+                ])
+            w(t5)
+
         w(f"\n{sep}")
         w("  END OF AUDIT REPORT")
         w(sep + "\n")
@@ -281,10 +313,12 @@ def analyze_intraday_leakage_continuous(
         threshold are skipped. Example: 10_000_000 (10 million EUR).
 
     Returns:
-    Tuple[pd.DataFrame, pd.DataFrame]:
+    Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         - results_df: one row per grouped exec-date/position key with leakage metrics.
         - flagged_trades_df: original trade rows that belong to flagged leakage groups,
           enriched with leakage metrics and exec-date columns.
+        - hourly_flagged_df: hourly sum of buy and sell nominal per flagged leakage group,
+          with columns Hour_Bucket, Sum_Buy_Nominal, Sum_Sell_Nominal, Net_Nominal, Trade_Count.
     """
     os.makedirs(output_folder, exist_ok=True)
     df = df.copy()
@@ -387,6 +421,17 @@ def analyze_intraday_leakage_continuous(
     )
 
     # 5) Evaluate leakage per exec-date and position key.
+    # Build a mapping from underlyingId to assetName for use in reports and plots.
+    # Use the most frequent assetName per underlyingId to handle any inconsistencies.
+    if "assetName" in df.columns:
+        asset_name_map = (
+            df.groupby("underlyingId")["assetName"]
+            .agg(lambda x: x.mode().iloc[0] if not x.mode().empty else x.iloc[0])
+            .to_dict()
+        )
+    else:
+        asset_name_map = {}
+
     summary_data = []
     group_frames = {}
     daily_keys = ["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"]
@@ -450,6 +495,7 @@ def analyze_intraday_leakage_continuous(
                 "ExecDate": exec_date,
                 "Portfolio": port,
                 "Underlying": und,
+                "AssetName": asset_name_map.get(und, str(und)),
                 "Maturity": mat,
                 "Currency": ccy,
                 "Bin_Count": bin_count,
@@ -579,7 +625,7 @@ def analyze_intraday_leakage_continuous(
             ax1.grid(axis="y", linestyle=":", alpha=0.5)
             ax1.set_title(
                 f"Intraday Risk Leakage – Cumulative Position\n"
-                f"{row['Underlying']} ({row['Currency']}) | {row['Portfolio']} | {row['ExecDate']}\n"
+                f"{row['AssetName']} [{row['Underlying']}] ({row['Currency']}) | {row['Portfolio']} | {row['ExecDate']}\n"
                 f"Peak: {max_exposure:,.0f} EUR | EOD: {eod_nominal:,.0f} EUR | {plot_metric}: {row[plot_metric]:,.2f}",
                 fontsize=11,
             )
@@ -710,6 +756,33 @@ def analyze_intraday_leakage_continuous(
         }
     )
 
+    # Build hourly buy/sell nominal summary for flagged leakage groups.
+    hourly_flagged_df = (
+        hourly_net.merge(
+            leakage_flag_keys,
+            on=["execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency"],
+            how="inner",
+        )
+        [[
+            "execDate", "portfolioId", "underlyingId", "maturity", "underlyingCurrency",
+            "hour_bucket", "buy_nominal", "sell_nominal", "signed_nominal", "trade_count",
+        ]]
+        .rename(columns={
+            "execDate": "ExecDate",
+            "portfolioId": "Portfolio",
+            "underlyingId": "Underlying",
+            "maturity": "Maturity",
+            "underlyingCurrency": "Currency",
+            "hour_bucket": "Hour_Bucket",
+            "buy_nominal": "Sum_Buy_Nominal",
+            "sell_nominal": "Sum_Sell_Nominal",
+            "signed_nominal": "Net_Nominal",
+            "trade_count": "Trade_Count",
+        })
+        .sort_values(["ExecDate", "Portfolio", "Underlying", "Maturity", "Currency", "Hour_Bucket"])
+        .reset_index(drop=True)
+    )
+
     # 8) Export reports.
     csv_path = os.path.join(output_folder, "Full_Leakage_Report_Continuous.csv")
     results_df.to_csv(csv_path, index=False)
@@ -717,21 +790,25 @@ def analyze_intraday_leakage_continuous(
     flagged_trades_csv = os.path.join(output_folder, "Leakage_Flagged_Trades.csv")
     flagged_trades_df.to_csv(flagged_trades_csv, index=False)
 
+    hourly_flagged_csv = os.path.join(output_folder, "Leakage_Flagged_Trades_Hourly.csv")
+    hourly_flagged_df.to_csv(hourly_flagged_csv, index=False)
+
     # 9) Write auditor report to text file.
     audit_report_path = os.path.join(output_folder, "Audit_Report.txt")
-    _write_audit_report(results_df, flagged_trades_df, audit_report_path)
+    _write_audit_report(results_df, flagged_trades_df, audit_report_path, hourly_flagged_df)
 
     print(f"Plots Generated              : {plotted_count}")
     print(f"Full Report                  : {csv_path}")
     print(f"Flagged Trades CSV           : {flagged_trades_csv}")
+    print(f"Flagged Trades Hourly CSV    : {hourly_flagged_csv}")
     print(f"Audit Report TXT             : {audit_report_path}")
 
-    return results_df, flagged_trades_df
+    return results_df, flagged_trades_df, hourly_flagged_df
 
 
 if __name__ == "__main__":
     df_trades = pd.read_csv("output/synthetic_trading_data.csv")
-    results, flagged = analyze_intraday_leakage_continuous(
+    results, flagged, hourly_flagged = analyze_intraday_leakage_continuous(
         df_trades,
         currency_rates_path="output/currency_rates.xlsx",
         plot_top_pct=5,
