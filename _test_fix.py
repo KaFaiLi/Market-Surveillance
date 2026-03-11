@@ -11,7 +11,7 @@ df = pd.read_csv("output/synthetic_trading_data.csv")
 print(f"Input rows: {len(df)}")
 print(f"Unique currencies: {sorted(df['underlyingCurrency'].dropna().unique())}")
 
-results, flagged = analyze_intraday_leakage_continuous(
+results, flagged, hourly_flagged = analyze_intraday_leakage_continuous(
     df,
     output_folder="hourly_risk_analysis_continuous",
     plot_top_pct=0,
