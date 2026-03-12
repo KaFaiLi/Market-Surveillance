@@ -248,7 +248,8 @@ def _load_initial_positions(path):
     Matching keys
     -------------
     FUT : (portfolioId, assetName, maturity)
-          assetName = position-file stockId
+          assetName = position-file futureContractId
+                      (falls back to stockId if futureContractId is absent)
           maturity  = as-is (e.g. "2024-06-21+01:00[Europe/Paris]")
     SHA : (portfolioId, assetName)
           assetName = position-file stockId
@@ -266,7 +267,7 @@ def _load_initial_positions(path):
     pos_df = pd.read_parquet(path)
 
     # Cast key join columns to str so they match the string-typed trade columns.
-    for _col in ["portfolioId", "stockId", "maturity", "position_category"]:
+    for _col in ["portfolioId", "stockId", "futureContractId", "maturity", "position_category"]:
         if _col in pos_df.columns:
             pos_df[_col] = pos_df[_col].astype(str)
 
@@ -274,18 +275,28 @@ def _load_initial_positions(path):
     pos_df["initial_pos"] = pd.to_numeric(pos_df["position"], errors="coerce").fillna(0.0)
     pos_df = pos_df[pos_df["initial_pos"] != 0.0].copy()
 
-    # Rename stockId → assetName to align with the trade file join key.
-    pos_df = pos_df.rename(columns={"stockId": "assetName"})
+    # For futures: assetName = futureContractId (the contract-level identifier).
+    # For shares:  assetName = stockId.
+    fut_mask = pos_df["position_category"] == "futurePosition"
+    sha_mask = pos_df["position_category"] == "stockPosition"
+
+    fut_rows = pos_df[fut_mask].copy()
+    if "futureContractId" in fut_rows.columns:
+        fut_rows["assetName"] = fut_rows["futureContractId"]
+    else:
+        # Fallback to stockId if futureContractId column is absent.
+        fut_rows["assetName"] = fut_rows["stockId"]
+
+    sha_rows = pos_df[sha_mask].copy()
+    sha_rows["assetName"] = sha_rows["stockId"]
 
     fut_pos = (
-        pos_df[pos_df["position_category"] == "futurePosition"]
-        [["portfolioId", "assetName", "maturity", "initial_pos"]]
+        fut_rows[["portfolioId", "assetName", "maturity", "initial_pos"]]
         .copy()
     )
 
     sha_pos = (
-        pos_df[pos_df["position_category"] == "stockPosition"]
-        [["portfolioId", "assetName", "initial_pos"]]
+        sha_rows[["portfolioId", "assetName", "initial_pos"]]
         .copy()
     )
 
