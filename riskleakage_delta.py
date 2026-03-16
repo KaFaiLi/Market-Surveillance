@@ -652,6 +652,7 @@ def analyze_intraday_leakage_continuous(
         # Reindex each product's delta & qty onto the full hour grid.
         fut_delta_cols = []
         fut_qty_cols = []
+        fut_cum_pos_cols = []
         fut_buy_nom_cols = []
         fut_sell_nom_cols = []
         fut_count_cols = []
@@ -666,8 +667,10 @@ def analyze_intraday_leakage_continuous(
                 buy_s = idx["buy_nominal"].reindex(all_hours).fillna(0)
                 sell_s = idx["sell_nominal"].reindex(all_hours).fillna(0)
                 cnt_s = idx["trade_count"].reindex(all_hours).fillna(0)
+                cum_pos_s = idx["cumulative_pos"].reindex(all_hours).ffill().fillna(0)
                 fut_delta_cols.append(delta_s)
                 fut_qty_cols.append(qty_s)
+                fut_cum_pos_cols.append(cum_pos_s)
                 fut_buy_nom_cols.append(buy_s)
                 fut_sell_nom_cols.append(sell_s)
                 fut_count_cols.append(cnt_s)
@@ -679,6 +682,7 @@ def analyze_intraday_leakage_continuous(
 
         sha_delta_cols = []
         sha_qty_cols = []
+        sha_cum_pos_cols = []
         sha_buy_nom_cols = []
         sha_sell_nom_cols = []
         sha_count_cols = []
@@ -693,8 +697,10 @@ def analyze_intraday_leakage_continuous(
                 buy_s = idx["buy_nominal"].reindex(all_hours).fillna(0)
                 sell_s = idx["sell_nominal"].reindex(all_hours).fillna(0)
                 cnt_s = idx["trade_count"].reindex(all_hours).fillna(0)
+                cum_pos_s = idx["cumulative_pos"].reindex(all_hours).ffill().fillna(0)
                 sha_delta_cols.append(delta_s)
                 sha_qty_cols.append(qty_s)
+                sha_cum_pos_cols.append(cum_pos_s)
                 sha_buy_nom_cols.append(buy_s)
                 sha_sell_nom_cols.append(sell_s)
                 sha_count_cols.append(cnt_s)
@@ -722,6 +728,16 @@ def analyze_intraday_leakage_continuous(
         total_qty_sha = (
             pd.concat(sha_qty_cols, axis=1).sum(axis=1)
             if sha_qty_cols
+            else pd.Series(0.0, index=all_hours)
+        )
+        total_cum_pos_fut = (
+            pd.concat(fut_cum_pos_cols, axis=1).sum(axis=1)
+            if fut_cum_pos_cols
+            else pd.Series(0.0, index=all_hours)
+        )
+        total_cum_pos_sha = (
+            pd.concat(sha_cum_pos_cols, axis=1).sum(axis=1)
+            if sha_cum_pos_cols
             else pd.Series(0.0, index=all_hours)
         )
         # Buy / sell / count per deal type.
@@ -763,6 +779,8 @@ def analyze_intraday_leakage_continuous(
             "delta_sha": total_delta_sha.values,
             "qty_fut": total_qty_fut.values,
             "qty_sha": total_qty_sha.values,
+            "cum_pos_fut": total_cum_pos_fut.values,
+            "cum_pos_sha": total_cum_pos_sha.values,
             "buy_nom_fut": total_buy_fut.values,
             "sell_nom_fut": total_sell_fut.values,
             "count_fut": total_count_fut.values.astype(int),
@@ -868,8 +886,9 @@ def analyze_intraday_leakage_continuous(
                 full_df[_col] = full_df[_col].fillna(0.0)
             for _col in ["count_fut", "count_sha"]:
                 full_df[_col] = full_df[_col].fillna(0).astype(int)
-            # Forward-fill cumulative delta columns then back-fill leading gaps.
-            for _col in ["delta_fut", "delta_sha", "portfolio_delta"]:
+            # Forward-fill cumulative columns then back-fill leading gaps.
+            for _col in ["delta_fut", "delta_sha", "portfolio_delta",
+                         "cum_pos_fut", "cum_pos_sha"]:
                 full_df[_col] = full_df[_col].ffill().bfill().fillna(0.0)
 
             h_starts = full_df["hour_bucket"]
@@ -949,30 +968,19 @@ def analyze_intraday_leakage_continuous(
                 fontsize=10,
             )
 
-            # ── Chart 2: FUT Buy/Sell Nominal (bars) + Trade Count (line)
+            # ── Chart 2: FUT Cumulative Position (bars) + Trade Count (line)
             ax_fut.bar(
                 h_starts,
-                full_df["buy_nom_fut"],
-                width=nom_bar_width,
+                full_df["cum_pos_fut"],
+                width=bar_width,
                 align="edge",
-                alpha=0.65,
-                color="#2ca02c",
-                edgecolor="#1a6e1a",
+                alpha=0.55,
+                color="#ff7f0e",
+                edgecolor="#b25600",
                 linewidth=0.5,
-                label="FUT Buy Nominal (EUR)",
+                label="FUT Cumulative Position (qty)",
             )
-            ax_fut.bar(
-                h_starts + sell_bar_offset,
-                -full_df["sell_nom_fut"],
-                width=nom_bar_width,
-                align="edge",
-                alpha=0.65,
-                color="#d62728",
-                edgecolor="#8b1a1a",
-                linewidth=0.5,
-                label="FUT Sell Nominal (EUR)",
-            )
-            ax_fut.set_ylabel("FUT Nominal (EUR)", fontsize=9)
+            ax_fut.set_ylabel("FUT Cumulative Position (qty)", fontsize=9)
             ax_fut.axhline(0, color="black", linewidth=0.5)
             ax_fut.yaxis.set_major_formatter(
                 plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
@@ -982,44 +990,33 @@ def analyze_intraday_leakage_continuous(
             ax_fut2.plot(
                 h_centers,
                 full_df["count_fut"],
-                color="#ff7f0e",
+                color="#d62728",
                 linewidth=1.5,
                 marker="o",
                 markersize=3,
                 label="FUT Trade Count",
             )
-            ax_fut2.set_ylabel("Trade Count", color="#ff7f0e", fontsize=9)
-            ax_fut2.tick_params(axis="y", labelcolor="#ff7f0e")
+            ax_fut2.set_ylabel("Trade Count", color="#d62728", fontsize=9)
+            ax_fut2.tick_params(axis="y", labelcolor="#d62728")
             lines_f1, labels_f1 = ax_fut.get_legend_handles_labels()
             lines_f2, labels_f2 = ax_fut2.get_legend_handles_labels()
             ax_fut.legend(lines_f1 + lines_f2, labels_f1 + labels_f2, loc="upper left", fontsize=8)
             ax_fut.grid(axis="y", linestyle=":", alpha=0.5)
-            ax_fut.set_title("Futures – Buy / Sell Nominal & Trade Count", fontsize=10)
+            ax_fut.set_title("Futures – Cumulative Position & Trade Count", fontsize=10)
 
-            # ── Chart 3: SHA Buy/Sell Nominal (bars) + Trade Count (line)
+            # ── Chart 3: SHA Cumulative Position (bars) + Trade Count (line)
             ax_sha.bar(
                 h_starts,
-                full_df["buy_nom_sha"],
-                width=nom_bar_width,
+                full_df["cum_pos_sha"],
+                width=bar_width,
                 align="edge",
-                alpha=0.65,
-                color="#2ca02c",
-                edgecolor="#1a6e1a",
+                alpha=0.55,
+                color="#1f77b4",
+                edgecolor="#0d4f8b",
                 linewidth=0.5,
-                label="SHA Buy Nominal (EUR)",
+                label="SHA Cumulative Position (qty)",
             )
-            ax_sha.bar(
-                h_starts + sell_bar_offset,
-                -full_df["sell_nom_sha"],
-                width=nom_bar_width,
-                align="edge",
-                alpha=0.65,
-                color="#d62728",
-                edgecolor="#8b1a1a",
-                linewidth=0.5,
-                label="SHA Sell Nominal (EUR)",
-            )
-            ax_sha.set_ylabel("SHA Nominal (EUR)", fontsize=9)
+            ax_sha.set_ylabel("SHA Cumulative Position (qty)", fontsize=9)
             ax_sha.axhline(0, color="black", linewidth=0.5)
             ax_sha.yaxis.set_major_formatter(
                 plt.FuncFormatter(lambda x, _: f"{x:,.0f}")
@@ -1029,19 +1026,19 @@ def analyze_intraday_leakage_continuous(
             ax_sha2.plot(
                 h_centers,
                 full_df["count_sha"],
-                color="#1f77b4",
+                color="#d62728",
                 linewidth=1.5,
                 marker="o",
                 markersize=3,
                 label="SHA Trade Count",
             )
-            ax_sha2.set_ylabel("Trade Count", color="#1f77b4", fontsize=9)
-            ax_sha2.tick_params(axis="y", labelcolor="#1f77b4")
+            ax_sha2.set_ylabel("Trade Count", color="#d62728", fontsize=9)
+            ax_sha2.tick_params(axis="y", labelcolor="#d62728")
             lines_s1, labels_s1 = ax_sha.get_legend_handles_labels()
             lines_s2, labels_s2 = ax_sha2.get_legend_handles_labels()
             ax_sha.legend(lines_s1 + lines_s2, labels_s1 + labels_s2, loc="upper left", fontsize=8)
             ax_sha.grid(axis="y", linestyle=":", alpha=0.5)
-            ax_sha.set_title("Shares – Buy / Sell Nominal & Trade Count", fontsize=10)
+            ax_sha.set_title("Shares – Cumulative Position & Trade Count", fontsize=10)
 
             # ── Shared X-axis formatting ───────────────────────────────
             x_start = h_starts.iloc[0]
