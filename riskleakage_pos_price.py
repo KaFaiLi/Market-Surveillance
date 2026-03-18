@@ -606,18 +606,21 @@ def analyze_intraday_leakage_continuous(
             full_df["cumulative_nominal"] = full_df["cumulative_nominal"].ffill()
             # If leading hours had no trades, back-fill with SOD position.
             full_df["cumulative_nominal"] = full_df["cumulative_nominal"].bfill()
+            # Forward/back-fill cumulative quantity and avg price for gap hours.
+            full_df["cumulative_position"] = full_df["cumulative_position"].ffill().bfill()
+            full_df["avg_price"] = full_df["avg_price"].ffill().bfill()
 
             hour_bin_starts = full_df["hour_bucket"]
             hour_bin_centers = hour_bin_starts + timedelta(minutes=30)
             sod_time_center = sod_time + timedelta(minutes=30)
             eod_time_center = eod_time + timedelta(minutes=30)
 
-            fig, (ax1, ax2) = plt.subplots(
-                2, 1, figsize=(13, 10), sharex=True,
-                gridspec_kw={"height_ratios": [1.2, 1]},
+            fig, (ax1, ax2, ax3) = plt.subplots(
+                3, 1, figsize=(13, 14), sharex=True,
+                gridspec_kw={"height_ratios": [1.2, 1, 1]},
             )
 
-            # ── Chart 1: Cumulative Position (bars) + SOD→EOD net flow line ──
+            # ── Chart 1: Cumulative Position (bars) + SOD→EOD net flow line + Cumulative Qty ──
             bar_width = timedelta(minutes=50)
             ax1.bar(
                 hour_bin_starts,
@@ -645,7 +648,29 @@ def analyze_intraday_leakage_continuous(
 
             ax1.set_ylabel("Nominal (EUR)")
             ax1.axhline(0, color="black", linewidth=0.5)
-            ax1.legend(loc="upper left", fontsize=8)
+
+            # Cumulative quantity on secondary y-axis.
+            ax1b = ax1.twinx()
+            ax1b.plot(
+                hour_bin_centers,
+                full_df["cumulative_position"],
+                color="#9467bd",
+                linewidth=2,
+                marker="s",
+                markersize=4,
+                linestyle="-",
+                label="Cumulative Qty",
+            )
+            ax1b.set_ylabel("Cumulative Quantity (contracts)", color="#9467bd")
+            ax1b.tick_params(axis="y", labelcolor="#9467bd")
+
+            # Combine legends from both axes of Chart 1.
+            lines_1a, labels_1a = ax1.get_legend_handles_labels()
+            lines_1b, labels_1b = ax1b.get_legend_handles_labels()
+            ax1.legend(
+                lines_1a + lines_1b, labels_1a + labels_1b,
+                loc="upper left", fontsize=8,
+            )
             ax1.grid(axis="y", linestyle=":", alpha=0.5)
             ax1.set_title(
                 f"Intraday Risk Leakage – Cumulative Position\n"
@@ -708,14 +733,30 @@ def analyze_intraday_leakage_continuous(
             )
             ax2.grid(axis="y", linestyle=":", alpha=0.5)
 
+            # ── Chart 3: Average Price over time ──
+            ax3.plot(
+                hour_bin_centers,
+                full_df["avg_price"],
+                color="#8c564b",
+                linewidth=2,
+                marker="D",
+                markersize=4,
+                linestyle="-",
+                label="Avg Price (EUR)",
+            )
+            ax3.set_ylabel("Avg Price (EUR)")
+            ax3.set_title("Average Price", fontsize=10)
+            ax3.legend(loc="upper left", fontsize=8)
+            ax3.grid(axis="y", linestyle=":", alpha=0.5)
+
             # Shared x-axis formatting.
             x_start = hour_bin_starts.iloc[0]
             x_end = hour_bin_starts.iloc[-1] + timedelta(hours=1)
-            ax2.set_xlim(x_start, x_end)
-            ax2.xaxis.set_major_locator(mdates.HourLocator(interval=1))
-            ax2.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-            ax2.set_xlabel(f"Hour ({local_tz_name})")
-            ax2.tick_params(axis="x", labelrotation=45)
+            ax3.set_xlim(x_start, x_end)
+            ax3.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+            ax3.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+            ax3.set_xlabel(f"Hour ({local_tz_name})")
+            ax3.tick_params(axis="x", labelrotation=45)
 
             safe_name = (
                 f"{row['ExecDate']}_{row['Portfolio']}_{row['Underlying']}_{row['Currency']}".replace(
